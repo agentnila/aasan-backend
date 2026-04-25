@@ -1,0 +1,4 @@
+flask==3.0.0
+neo4j==5.17.0
+mem0ai==0.1.29
+gunicorn==21.2.0
