@@ -65,6 +65,18 @@ def health():
 # NEO4J ENDPOINTS
 # ─────────────────────────────────────────────
 
+def serialize_neo4j(value):
+    """Convert Neo4j types to JSON-serializable Python types."""
+    from neo4j.time import DateTime, Date
+    if isinstance(value, (DateTime, Date)):
+        return str(value)
+    return value
+
+def serialize_node(node):
+    """Convert a Neo4j node to a JSON-serializable dict."""
+    return {k: serialize_neo4j(v) for k, v in dict(node).items()}
+
+
 @app.route("/neo4j/write_concept", methods=["POST"])
 def write_concept():
     """
@@ -147,7 +159,7 @@ def write_concept():
         return jsonify({
             "status": "ok",
             "concept": data.get("name"),
-            "connections_created": len(connects_to)
+            "connections_created": len(data.get("connects_to", []) if isinstance(data.get("connects_to"), list) else [])
         })
 
     except Exception as e:
@@ -189,7 +201,7 @@ def get_concepts():
 
             concepts = []
             for record in result:
-                concept = dict(record["c"])
+                concept = serialize_node(record["c"])
                 concepts.append(concept)
 
         return jsonify({"status": "ok", "concepts": concepts, "count": len(concepts)})
