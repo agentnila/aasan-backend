@@ -11,11 +11,13 @@ Make.com calls these endpoints from its HTTP modules.
 """
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from neo4j import GraphDatabase
 from mem0 import MemoryClient
 import os
 
 app = Flask(__name__)
+CORS(app)  # Allow all origins — needed for browser graph visualisation
 
 # ─────────────────────────────────────────────
 # Configuration — set these as Render env vars
