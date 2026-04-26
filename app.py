@@ -1,13 +1,17 @@
 """
-Aasan — Peraasan Backend Scripts
-Deployed on Render.com (free tier)
+Aasan V2 — Peraasan Backend
+Deployed on Render.com
 
-Two endpoints:
-1. /neo4j/* — Knowledge graph writer (Neo4j AuraDB)
-2. /mem0/* — Persistent memory bridge (Mem0)
-3. /health — Health check
+Endpoints:
+1. /neo4j/*    — Knowledge graph (Neo4j AuraDB)
+2. /mem0/*     — Persistent memory (Mem0)
+3. /content/*  — Content index CRUD (in-memory for Phase 1, Airtable later)
+4. /review/*   — Spaced review scheduling
+5. /capture/*  — Knowledge capture (save learning session results)
+6. /clerk/*    — Clerk webhook receiver
+7. /health     — Health check
 
-Make.com calls these endpoints from its HTTP modules.
+Called by: React app (browser) and Perplexity Computer (local agent)
 """
 
 from flask import Flask, request, jsonify
@@ -15,6 +19,8 @@ from flask_cors import CORS
 from neo4j import GraphDatabase
 from mem0 import MemoryClient
 import os
+import json
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -419,6 +425,457 @@ def mem0_add_session_summary():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ─────────────────────────────────────────────
+# CONTENT INDEX ENDPOINTS
+# In-memory store for Phase 1. Migrate to Airtable/DB later.
+# Perplexity Computer calls these to index content it discovers.
+# ─────────────────────────────────────────────
+
+content_index = []  # In-memory for Phase 1
+
+
+@app.route("/content/add", methods=["POST"])
+def content_add():
+    """
+    Add a content item to the index.
+    Called by: Perplexity Computer (after crawling/classifying)
+    or React app (manager upload).
+
+    Expected payload:
+    {
+        "title": "Kubernetes Architecture Overview",
+        "source": "coursera",
+        "source_url": "https://...",
+        "content_type": "video",
+        "duration_minutes": 45,
+        "difficulty": "intermediate",
+        "skills": ["kubernetes", "containers"],
+        "concepts_covered": ["pods", "services"],
+        "prerequisites": ["container_basics"],
+        "ai_summary": "Covers the core building blocks...",
+        "quality_score": 0.87,
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    data["content_id"] = f"content-{len(content_index) + 1}"
+    data["indexed_at"] = datetime.utcnow().isoformat()
+    content_index.append(data)
+
+    return jsonify({
+        "status": "ok",
+        "content_id": data["content_id"],
+        "total_indexed": len(content_index)
+    })
+
+
+@app.route("/content/search", methods=["POST"])
+def content_search():
+    """
+    Search the content index by query.
+    Called by: React app (when Peraasan needs content for recommendations).
+
+    Expected payload:
+    {
+        "query": "kubernetes networking",
+        "limit": 10,
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    query = data.get("query", "").lower()
+    limit = data.get("limit", 10)
+
+    # Simple keyword search for Phase 1
+    results = []
+    for item in content_index:
+        searchable = json.dumps(item).lower()
+        if query in searchable or any(q in searchable for q in query.split()):
+            results.append(item)
+        if len(results) >= limit:
+            break
+
+    return jsonify({
+        "status": "ok",
+        "results": results,
+        "count": len(results)
+    })
+
+
+@app.route("/content/list", methods=["POST"])
+def content_list():
+    """
+    List all indexed content.
+    Called by: React app (for sources panel).
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return jsonify({
+        "status": "ok",
+        "content": content_index,
+        "count": len(content_index)
+    })
+
+
+# ─────────────────────────────────────────────
+# KNOWLEDGE CAPTURE ENDPOINTS
+# Called after a learning session to persist what was learned.
+# Browser calls Claude to extract → then calls these to save.
+# ─────────────────────────────────────────────
+
+@app.route("/capture/session", methods=["POST"])
+def capture_session():
+    """
+    Save a complete learning session — concepts to Neo4j + memory to Mem0.
+    Called by: React app after Claude extracts concepts from a session.
+
+    Expected payload:
+    {
+        "user_id": "emp-sarah-001",
+        "session_title": "Kubernetes Networking",
+        "concepts": [
+            {"name": "ClusterIP", "definition": "...", "subject": "Cloud",
+             "domain": "Kubernetes", "confidence": 0.7, "is_gap": false,
+             "gap_type": "none", "connects_to": ["Services"]}
+        ],
+        "gaps": ["Service Mesh"],
+        "summary": "Learned about Kubernetes networking...",
+        "duration_minutes": 25,
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    user_id = data.get("user_id")
+    driver = get_neo4j_driver()
+    client = get_mem0_client()
+    concepts_saved = 0
+    memories_added = 0
+
+    # Save each concept to Neo4j
+    if driver:
+        try:
+            with driver.session() as session:
+                for concept in data.get("concepts", []):
+                    session.run("""
+                        MERGE (c:Concept {name: $name, user_id: $user_id})
+                        ON CREATE SET
+                            c.id = randomUUID(),
+                            c.definition = $definition,
+                            c.subject = $subject,
+                            c.domain = $domain,
+                            c.mastery_score = $confidence,
+                            c.confidence = $confidence,
+                            c.is_gap = $is_gap,
+                            c.gap_type = $gap_type,
+                            c.first_captured = datetime(),
+                            c.last_reinforced = datetime(),
+                            c.capture_count = 1
+                        ON MATCH SET
+                            c.mastery_score = (c.mastery_score + $confidence) / 2,
+                            c.confidence = (c.confidence + $confidence) / 2,
+                            c.is_gap = $is_gap,
+                            c.gap_type = $gap_type,
+                            c.last_reinforced = datetime(),
+                            c.capture_count = c.capture_count + 1
+                    """,
+                        name=concept.get("name"),
+                        user_id=user_id,
+                        definition=concept.get("definition", ""),
+                        subject=concept.get("subject", ""),
+                        domain=concept.get("domain", ""),
+                        confidence=float(concept.get("confidence", 0.5)),
+                        is_gap=concept.get("is_gap", False),
+                        gap_type=concept.get("gap_type", "none")
+                    )
+                    # Create relationships
+                    for related in concept.get("connects_to", []):
+                        session.run("""
+                            MATCH (a:Concept {name: $name, user_id: $user_id})
+                            MERGE (b:Concept {name: $related, user_id: $user_id})
+                            ON CREATE SET b.id = randomUUID(), b.capture_count = 0
+                            MERGE (a)-[:CONNECTS_TO]->(b)
+                        """, name=concept.get("name"), user_id=user_id, related=related)
+                    concepts_saved += 1
+        except Exception as e:
+            return jsonify({"error": f"Neo4j error: {str(e)}"}), 500
+
+    # Save session summary to Mem0
+    if client:
+        try:
+            summary = data.get("summary", "")
+            if summary:
+                client.add(
+                    messages=[{"role": "user", "content": f"Session completed: {summary}"}],
+                    user_id=user_id
+                )
+                memories_added += 1
+
+            # Save each gap as a memory
+            for gap in data.get("gaps", []):
+                client.add(
+                    messages=[{"role": "user", "content": f"Gap detected: {gap} — needs attention"}],
+                    user_id=user_id
+                )
+                memories_added += 1
+        except Exception as e:
+            return jsonify({"error": f"Mem0 error: {str(e)}"}), 500
+
+    return jsonify({
+        "status": "ok",
+        "concepts_saved": concepts_saved,
+        "memories_added": memories_added
+    })
+
+
+# ─────────────────────────────────────────────
+# SPACED REVIEW ENDPOINTS
+# In-memory review queue for Phase 1.
+# Called by: React app on login to check due reviews.
+# ─────────────────────────────────────────────
+
+review_queue = {}  # In-memory: { user_id: [{ concept, next_review, interval, ease }] }
+
+
+@app.route("/review/schedule", methods=["POST"])
+def review_schedule():
+    """
+    Schedule a concept for spaced review.
+    Called by: React app after knowledge capture.
+
+    Expected payload:
+    {
+        "user_id": "emp-sarah-001",
+        "concept_name": "Kubernetes Pods",
+        "initial_mastery": 0.7,
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    user_id = data.get("user_id")
+
+    if user_id not in review_queue:
+        review_queue[user_id] = []
+
+    # Don't duplicate
+    existing = [r for r in review_queue[user_id] if r["concept"] == data.get("concept_name")]
+    if not existing:
+        review_queue[user_id].append({
+            "concept": data.get("concept_name"),
+            "next_review": (datetime.utcnow() + timedelta(days=1)).isoformat(),
+            "interval_days": 1,
+            "ease_factor": 2.5,
+            "review_count": 0,
+            "mastery": data.get("initial_mastery", 0.5)
+        })
+
+    return jsonify({"status": "ok", "reviews_queued": len(review_queue[user_id])})
+
+
+@app.route("/review/due", methods=["POST"])
+def review_due():
+    """
+    Get concepts due for review today.
+    Called by: React app on login / session start.
+
+    Expected payload:
+    {
+        "user_id": "emp-sarah-001",
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    user_id = data.get("user_id")
+    now = datetime.utcnow().isoformat()
+
+    due = [r for r in review_queue.get(user_id, []) if r["next_review"] <= now]
+
+    return jsonify({
+        "status": "ok",
+        "due": due,
+        "count": len(due)
+    })
+
+
+@app.route("/review/complete", methods=["POST"])
+def review_complete():
+    """
+    Record a review result — update interval using SM-2 algorithm.
+    Called by: React app after employee answers a review question.
+
+    Expected payload:
+    {
+        "user_id": "emp-sarah-001",
+        "concept_name": "Kubernetes Pods",
+        "rating": 3,
+        "secret": "aasan-secret-2026"
+    }
+    rating: 1=forgot, 2=hard, 3=good, 4=easy
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    user_id = data.get("user_id")
+    concept_name = data.get("concept_name")
+    rating = data.get("rating", 3)
+
+    reviews = review_queue.get(user_id, [])
+    for r in reviews:
+        if r["concept"] == concept_name:
+            r["review_count"] += 1
+            if rating >= 3:
+                # SM-2: increase interval
+                r["ease_factor"] = max(1.3, r["ease_factor"] + 0.1 * (rating - 3))
+                r["interval_days"] = int(r["interval_days"] * r["ease_factor"])
+                r["mastery"] = min(1.0, r["mastery"] + 0.05 * rating)
+            else:
+                # Reset interval
+                r["interval_days"] = 1
+                r["ease_factor"] = max(1.3, r["ease_factor"] - 0.2)
+                r["mastery"] = max(0.0, r["mastery"] - 0.1)
+            r["next_review"] = (datetime.utcnow() + timedelta(days=r["interval_days"])).isoformat()
+            break
+
+    # Update mastery in Neo4j
+    driver = get_neo4j_driver()
+    if driver:
+        try:
+            with driver.session() as session:
+                mastery_val = next((r["mastery"] for r in reviews if r["concept"] == concept_name), 0.5)
+                session.run("""
+                    MATCH (c:Concept {name: $name, user_id: $user_id})
+                    SET c.mastery_score = $mastery, c.last_reinforced = datetime()
+                """, name=concept_name, user_id=user_id, mastery=mastery_val)
+        except Exception:
+            pass
+
+    return jsonify({"status": "ok", "next_review_days": r["interval_days"] if 'r' in dir() else 1})
+
+
+# ─────────────────────────────────────────────
+# CONTEXT ENDPOINT
+# Single call to get everything React needs on login.
+# Reduces round trips: one call → graph + memory + reviews.
+# ─────────────────────────────────────────────
+
+@app.route("/context/load", methods=["POST"])
+def context_load():
+    """
+    Load full employee context on login — knowledge graph + memories + due reviews.
+    Called by: React app on sign-in.
+
+    Expected payload:
+    {
+        "user_id": "emp-sarah-001",
+        "secret": "aasan-secret-2026"
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json
+    user_id = data.get("user_id")
+    result = {"status": "ok", "user_id": user_id}
+
+    # Get knowledge graph summary
+    driver = get_neo4j_driver()
+    if driver:
+        try:
+            with driver.session() as session:
+                # Concept count + gap count
+                stats = session.run("""
+                    MATCH (c:Concept {user_id: $user_id})
+                    RETURN count(c) as total,
+                           sum(CASE WHEN c.is_gap = true THEN 1 ELSE 0 END) as gaps,
+                           avg(c.mastery_score) as avg_mastery
+                """, user_id=user_id).single()
+                result["knowledge"] = {
+                    "total_concepts": stats["total"] if stats else 0,
+                    "gaps": stats["gaps"] if stats else 0,
+                    "avg_mastery": round(float(stats["avg_mastery"] or 0), 2) if stats else 0
+                }
+        except Exception as e:
+            result["knowledge"] = {"error": str(e)}
+
+    # Get recent memories
+    client = get_mem0_client()
+    if client:
+        try:
+            memories = client.search(
+                query="recent learning progress and goals",
+                filters={"user_id": user_id},
+                limit=10
+            )
+            result["memories"] = [m.get("memory", "") for m in memories if m.get("memory")]
+        except Exception as e:
+            result["memories"] = {"error": str(e)}
+
+    # Get due reviews
+    now = datetime.utcnow().isoformat()
+    due = [r for r in review_queue.get(user_id, []) if r["next_review"] <= now]
+    result["reviews_due"] = due
+
+    # Get content count
+    result["content_indexed"] = len(content_index)
+
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────
+# CLERK WEBHOOK
+# Receives user.created events from Clerk.
+# Creates employee record in Mem0.
+# ─────────────────────────────────────────────
+
+@app.route("/clerk/webhook", methods=["POST"])
+def clerk_webhook():
+    """
+    Receive Clerk webhook events.
+    Configure in Clerk Dashboard → Webhooks → endpoint: https://aasan-backend.onrender.com/clerk/webhook
+    """
+    data = request.json
+    event_type = data.get("type", "")
+
+    if event_type == "user.created":
+        user_data = data.get("data", {})
+        user_id = user_data.get("id", "")
+        email = ""
+        if user_data.get("email_addresses"):
+            email = user_data["email_addresses"][0].get("email_address", "")
+        first_name = user_data.get("first_name", "")
+
+        # Create initial memory in Mem0
+        client = get_mem0_client()
+        if client and user_id:
+            try:
+                client.add(
+                    messages=[{"role": "user", "content": f"New employee registered: {first_name} ({email}). No learning history yet. Goals not set."}],
+                    user_id=user_id
+                )
+            except Exception:
+                pass
+
+        return jsonify({"status": "ok", "user_id": user_id})
+
+    return jsonify({"status": "ok", "event": event_type})
 
 
 # ─────────────────────────────────────────────
