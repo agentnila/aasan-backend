@@ -332,7 +332,7 @@ def mem0_search():
     try:
         results = client.search(
             query=data.get("query"),
-            filters={"user_id": data.get("user_id")},
+            user_id=data.get("user_id"),
             limit=data.get("limit", 20)
         )
 
@@ -821,7 +821,7 @@ def context_load():
         try:
             memories = client.search(
                 query="recent learning progress and goals",
-                filters={"user_id": user_id},
+                user_id=user_id,
                 limit=10
             )
             result["memories"] = [m.get("memory", "") for m in memories if m.get("memory")]
