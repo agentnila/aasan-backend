@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1297,6 +1297,56 @@ def career_simulate():
     scenarios = data.get("scenarios")  # list of {id, name, description, effort_hours_per_week, horizon_months}
     profile = data.get("profile") or {}
     return jsonify(career_simulator.run_simulation(user_id=user_id, scenarios=scenarios, profile=profile))
+
+
+# ─────────────────────────────────────────────
+# V3 — Resume Module (living service record + job-tailored resume)
+# ─────────────────────────────────────────────
+
+@app.route("/resume/add", methods=["POST"])
+def resume_add():
+    """
+    Capture a journal entry. Two modes:
+      - Conversational: { user_id, raw_input } → Claude extracts structured fields
+      - Direct: { user_id, structured: {...} } → caller-provided structure
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    raw = data.get("raw_input", "")
+    structured = data.get("structured")
+    if not raw and not structured:
+        return jsonify({"error": "raw_input or structured required"}), 400
+    return jsonify(resume.add_entry(user_id=user_id, raw_input=raw, structured=structured))
+
+
+@app.route("/resume/journal", methods=["POST"])
+def resume_journal():
+    """List a user's full journal."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    limit = int(data.get("limit", 50))
+    return jsonify(resume.list_journal(user_id=user_id, limit=limit))
+
+
+@app.route("/resume/tailor", methods=["POST"])
+def resume_tailor():
+    """
+    The killer feature. Given a job posting URL (or pasted text),
+    return a tailored resume drawing from the user's journal.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    job_url = data.get("job_url", "").strip()
+    job_description = data.get("job_description", "").strip()
+    if not job_url and not job_description:
+        return jsonify({"error": "job_url or job_description required"}), 400
+    return jsonify(resume.tailor_resume(user_id=user_id, job_url=job_url, job_description=job_description))
 
 
 # ─────────────────────────────────────────────
