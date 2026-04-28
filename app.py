@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career
+from services import perplexity_client, claude_client, freshness, career, predigest
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1096,6 +1096,45 @@ def career_scan():
     max_signals = int(data.get("max_signals", 10))
 
     result = career.run_scan(user_id=user_id, target_role=target_role, max_signals=max_signals)
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────
+# V3 — Content Pre-digestion (third Perplexity Computer use case)
+# Deep-read a single long doc URL, return structured 5-concept digest.
+# ─────────────────────────────────────────────
+
+@app.route("/agent/predigest", methods=["POST"])
+def agent_predigest():
+    """
+    Pre-digest a long URL — Perplexity Computer fetches deeply, Claude extracts
+    structured concepts + TL;DR + suggested next step.
+
+    Body: {
+      "url": "https://...",
+      "learner_context": { "goal": "...", "current_path_step": "..." } (optional),
+      "secret": ...
+    }
+
+    Returns: {
+      url, title, source_domain,
+      tldr, key_concepts, reading_time_saved_minutes,
+      suggested_next_step,
+      modes: { computer, classifier },
+      fetched_at,
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+    url = (data.get("url") or "").strip()
+    learner_context = data.get("learner_context") or {}
+
+    if not url:
+        return jsonify({"error": "url is required"}), 400
+
+    result = predigest.predigest(url=url, learner_context=learner_context)
     return jsonify(result)
 
 
