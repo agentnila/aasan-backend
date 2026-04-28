@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1136,6 +1136,77 @@ def agent_predigest():
 
     result = predigest.predigest(url=url, learner_context=learner_context)
     return jsonify(result)
+
+
+# ─────────────────────────────────────────────
+# V3 — Path Engine (Live Persistent Learning Paths)
+# Each goal owns one path. Engine adjusts on triggers; manual learner
+# edits are sacred. Phase 1 store: in-memory dict per user_id.
+# ─────────────────────────────────────────────
+
+@app.route("/goal/list", methods=["POST"])
+def goal_list():
+    """List all active goals + path summary per goal for the user."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    return jsonify(path_engine.list_goals(user_id))
+
+
+@app.route("/path/get", methods=["POST"])
+def path_get():
+    """Fetch the full ordered path for a single goal."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    if not goal_id:
+        return jsonify({"error": "goal_id required"}), 400
+    return jsonify(path_engine.get_path(user_id, goal_id))
+
+
+@app.route("/path/recompute", methods=["POST"])
+def path_recompute():
+    """
+    Run the Path Adjustment Engine. Returns the diff that was applied.
+
+    Body: {
+      "user_id": str,
+      "goal_id": str,
+      "trigger": "session_complete" | "content_added" | "staleness_flag" | "assignment_create" | "learner_edit",
+      "trigger_payload": {} (optional, trigger-specific)
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    trigger = data.get("trigger", "session_complete")
+    payload = data.get("trigger_payload", {}) or {}
+    if not goal_id:
+        return jsonify({"error": "goal_id required"}), 400
+    return jsonify(path_engine.recompute(user_id, goal_id, trigger, payload))
+
+
+@app.route("/path/insert_step", methods=["POST"])
+def path_insert_step():
+    """
+    Manual learner edit — insert a step. Marked inserted_by=learner — sacred to engine.
+
+    Body: { user_id, goal_id, step: { title, order?, step_type?, estimated_minutes?, inserted_reason? } }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    step = data.get("step", {}) or {}
+    if not goal_id or not step.get("title"):
+        return jsonify({"error": "goal_id and step.title required"}), 400
+    return jsonify(path_engine.insert_step_manual(user_id, goal_id, step))
 
 
 # ─────────────────────────────────────────────
