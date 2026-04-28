@@ -99,17 +99,84 @@ def _live_stay_ahead(user_id: str, profile: dict) -> dict:
 # Stub — narratively coherent demo for Sarah Chen profile
 # ──────────────────────────────────────────────────────────────
 
+def _resilience_band(score):
+    """Map a 0-100 resilience score to a category band.
+    Calibrated to where most knowledge workers actually land (median ~60-65)."""
+    if score >= 80:
+        return {"label": "AI-Resilient", "tone": "green", "verdict": "Strong position. Top-quartile resilience. Stay sharp; market values your trajectory."}
+    if score >= 65:
+        return {"label": "Stable", "tone": "green", "verdict": "Well-positioned. A few specific moves keep you ahead of the curve."}
+    if score >= 50:
+        return {"label": "At Risk", "tone": "amber", "verdict": "Vulnerable to displacement within 18-24 months. Act this quarter — Stay Ahead has the moves."}
+    return {"label": "High Risk", "tone": "red", "verdict": "Significant displacement risk in 12 months. Pivot or upskill now — see the moves below."}
+
+
 def _stub_stay_ahead(user_id: str, profile: dict, modes: dict = None) -> dict:
     modes = modes or {"computer": "stub", "classifier": "stub"}
+
+    # AI-Resilience scoring — V3 headline metric
+    # vulnerability_score: 0 = AI-immune, 1 = high replacement risk (legacy field, kept for back-compat)
+    # ai_resilience_score: 0-100, HIGHER IS BETTER. The headline number people remember.
+    vulnerability_score = 0.32
+    ai_resilience_score = round((1 - vulnerability_score) * 100)  # 68
+    band = _resilience_band(ai_resilience_score)
+
+    # Trend — last 4 quarters (stub: gentle improvement reflecting Sarah's K8s + cloud track)
+    score_history = [
+        {"quarter": "Q2 2025", "score": 58},
+        {"quarter": "Q3 2025", "score": 62},
+        {"quarter": "Q4 2025", "score": 64},
+        {"quarter": "Q1 2026", "score": 66},
+        {"quarter": "Q2 2026", "score": ai_resilience_score},
+    ]
+
+    # Per-component breakdown — what makes up the composite
+    components = [
+        {"label": "Skill demand growth", "score": 78, "note": "Cloud Architect demand +18% YoY in your market"},
+        {"label": "AI task replacement risk", "score": 62, "note": "Some routine tasks (boilerplate, Terraform drafting) automatable today"},
+        {"label": "Up-the-stack mobility", "score": 72, "note": "Architectural judgment + customer-facing decisions are AI-resistant"},
+        {"label": "Geographic + financial mobility", "score": 65, "note": "Remote-friendly stack; comp at 75th percentile"},
+        {"label": "Cross-skill versatility", "score": 70, "note": "K8s + AWS + Linux + Python + presentation skills"},
+    ]
+
+    # Peer benchmark
+    peer_benchmark = {
+        "role": "Senior SWE (cloud track)",
+        "market": "US tech, 2026",
+        "peer_avg_score": 58,
+        "your_score": ai_resilience_score,
+        "delta_vs_peers": ai_resilience_score - 58,
+        "percentile": 73,
+    }
+
     return {
         "user_id": user_id,
         "profile": profile,
         "scanned_at": datetime.utcnow().isoformat(),
-        # NEW: AI-resilience — the deepest WHY for Stay Ahead.
-        # Every digest answers "is my job AI-safe and what do I do about it?"
+        # AI-Resilience — V3 headline metric
+        # Higher = less at-risk from AI or AI-built tooling
         "ai_resilience": {
-            "vulnerability_level": "low-medium",
-            "vulnerability_score": 0.32,  # 0 = AI-immune, 1 = high replacement risk
+            # NEW V3 — headline score (higher = better)
+            "score": ai_resilience_score,
+            "score_max": 100,
+            "band": band["label"],
+            "band_tone": band["tone"],
+            "band_verdict": band["verdict"],
+            "trend": {
+                "history": score_history,
+                "direction": "rising",
+                "change_last_quarter": ai_resilience_score - score_history[-2]["score"],
+                "narrative": (
+                    f"Your AI-Resilience score went {score_history[-2]['score']} → {ai_resilience_score} "
+                    f"this quarter — your move into agent-aware architecture work is paying off. "
+                    f"Sustained trajectory: +{ai_resilience_score - score_history[0]['score']} over 4 quarters."
+                ),
+            },
+            "components": components,
+            "peer_benchmark": peer_benchmark,
+            # Legacy + descriptive fields
+            "vulnerability_score": vulnerability_score,
+            "vulnerability_level": "low-medium",  # back-compat
             "headline": (
                 "Your Senior SWE → Cloud Architect track is RELATIVELY AI-resilient. "
                 "Architectural judgment, organizational alignment, and customer-facing decisions "
