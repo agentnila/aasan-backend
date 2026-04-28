@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1207,6 +1207,64 @@ def path_insert_step():
     if not goal_id or not step.get("title"):
         return jsonify({"error": "goal_id and step.title required"}), 400
     return jsonify(path_engine.insert_step_manual(user_id, goal_id, step))
+
+
+# ─────────────────────────────────────────────
+# V3 — SME Marketplace V1
+# Internal directory (auto-derived in Phase 2; demo seed in Phase 1) +
+# external curated marketplace + booking flow.
+# ─────────────────────────────────────────────
+
+@app.route("/sme/find", methods=["POST"])
+def sme_find():
+    """Match SMEs against a topic. Returns ranked list of internal + external."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    topic = data.get("topic", "").strip()
+    learner_id = data.get("learner_id", "demo-user")
+    limit = int(data.get("limit", 5))
+    if not topic:
+        return jsonify({"error": "topic required"}), 400
+    return jsonify(sme.find_smes(topic=topic, learner_id=learner_id, limit=limit))
+
+
+@app.route("/sme/book", methods=["POST"])
+def sme_book():
+    """Book a session with an SME (mock confirmation in Phase 1)."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    sme_id = data.get("sme_id")
+    learner_id = data.get("learner_id", "demo-user")
+    topic = data.get("topic", "")
+    slot = data.get("slot")
+    if not sme_id:
+        return jsonify({"error": "sme_id required"}), 400
+    return jsonify(sme.book_sme(sme_id=sme_id, learner_id=learner_id, topic=topic, slot=slot))
+
+
+@app.route("/sme/bookings", methods=["POST"])
+def sme_bookings():
+    """List a learner's bookings."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    learner_id = data.get("learner_id", "demo-user")
+    return jsonify(sme.list_bookings(learner_id=learner_id))
+
+
+@app.route("/sme/register", methods=["POST"])
+def sme_register():
+    """Internal employee opts in as an SME."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    employee_id = data.get("employee_id")
+    profile = data.get("profile", {}) or {}
+    if not employee_id:
+        return jsonify({"error": "employee_id required"}), 400
+    return jsonify(sme.register_internal_sme(employee_id=employee_id, profile=profile))
 
 
 # ─────────────────────────────────────────────
