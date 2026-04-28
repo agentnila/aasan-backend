@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1265,6 +1265,38 @@ def sme_register():
     if not employee_id:
         return jsonify({"error": "employee_id required"}), 400
     return jsonify(sme.register_internal_sme(employee_id=employee_id, profile=profile))
+
+
+# ─────────────────────────────────────────────
+# V3 — Career Compass / Stay Ahead
+# Mobility intelligence beyond training: best-fit roles, stretch roles,
+# pivot options, hands-on experiences, market risk signal.
+# ─────────────────────────────────────────────
+
+@app.route("/career/stay_ahead", methods=["POST"])
+def career_stay_ahead():
+    """Run a Stay Ahead scan — 5-section career mobility digest."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    profile = data.get("profile")
+    return jsonify(stay_ahead.run_stay_ahead(user_id=user_id, profile=profile))
+
+
+@app.route("/career/simulate", methods=["POST"])
+def career_simulate():
+    """
+    Career Scenario Planning Simulator — project 12-24 month outcomes for
+    2-3 candidate paths with probabilistic ranges.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    scenarios = data.get("scenarios")  # list of {id, name, description, effort_hours_per_week, horizon_months}
+    profile = data.get("profile") or {}
+    return jsonify(career_simulator.run_simulation(user_id=user_id, scenarios=scenarios, profile=profile))
 
 
 # ─────────────────────────────────────────────
