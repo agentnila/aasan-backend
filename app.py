@@ -28,7 +28,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness
+from services import perplexity_client, claude_client, freshness, career
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1056,6 +1056,46 @@ def freshness_scan():
     max_concepts = int(data.get("max_concepts", 5))
 
     result = freshness.run_scan(user_id=user_id, max_concepts=max_concepts)
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────
+# V3 — Career Compass / Market Watch
+# Three watcher pipelines (role market, course launches, vendor certs)
+# all running through Perplexity Computer scrape_pattern.
+# ─────────────────────────────────────────────
+
+@app.route("/career/scan", methods=["POST"])
+def career_scan():
+    """
+    Run a Career Compass scan — produces Career_Signals across role market,
+    course launches, vendor certs.
+
+    Body: {
+      "user_id": str,
+      "target_role": str (optional, defaults to demo role),
+      "max_signals": int (default 10),
+      "secret": ...
+    }
+
+    Returns: {
+      user_id, target_role, scanned_at, signals_count,
+      signals_by_type: { role_skill_shift, new_course, vendor_cert },
+      signals: [
+        { signal_type, title, body, relevance_score, content_ref, detected_at }, ...
+      ],
+      modes: { computer: live|stub, classifier: live|stub }
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+    user_id = data.get("user_id")
+    target_role = data.get("target_role")
+    max_signals = int(data.get("max_signals", 10))
+
+    result = career.run_scan(user_id=user_id, target_role=target_role, max_signals=max_signals)
     return jsonify(result)
 
 
