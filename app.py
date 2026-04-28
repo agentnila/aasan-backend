@@ -1,17 +1,22 @@
 """
-Aasan V2 — Peraasan Backend
+Aasan V3 — Peraasan Backend
 Deployed on Render.com
 
 Endpoints:
-1. /neo4j/*    — Knowledge graph (Neo4j AuraDB)
-2. /mem0/*     — Persistent memory (Mem0)
-3. /content/*  — Content index CRUD (in-memory for Phase 1, Airtable later)
-4. /review/*   — Spaced review scheduling
-5. /capture/*  — Knowledge capture (save learning session results)
-6. /clerk/*    — Clerk webhook receiver
-7. /health     — Health check
+1. /neo4j/*       — Knowledge graph (Neo4j AuraDB)
+2. /mem0/*        — Persistent memory (Mem0)
+3. /content/*     — Content index CRUD (in-memory for Phase 1, Airtable later)
+4. /review/*      — Spaced review scheduling
+5. /capture/*     — Knowledge capture (save learning session results)
+6. /clerk/*       — Clerk webhook receiver
+7. /health        — Health check
+8. /agent/*       — V3 deep agentic layer (Perplexity Computer wrapper)
+9. /freshness/*   — V3 Currency Watch (uses /agent + Claude classifier)
 
-Called by: React app (browser) and Perplexity Computer (local agent)
+Called by: React app (browser), the React app calls Render endpoints which
+in turn call Perplexity Computer (server-side) and Claude (server-side).
+The Peraasan Agent Bridge Chrome extension is browser-side only — it does
+not talk to this backend directly.
 """
 
 from flask import Flask, request, jsonify
@@ -21,6 +26,9 @@ from mem0 import MemoryClient
 import os
 import json
 from datetime import datetime, timedelta
+
+# V3: deep-agentic + reasoning service modules
+from services import perplexity_client, claude_client, freshness
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -876,6 +884,179 @@ def clerk_webhook():
         return jsonify({"status": "ok", "user_id": user_id})
 
     return jsonify({"status": "ok", "event": event_type})
+
+
+# ─────────────────────────────────────────────
+# V3 — Deep Agentic Layer (Perplexity Computer)
+# Generic /agent/computer_run is the single passthrough; specific consumers
+# (currency, career, content) call through here so we have one place that
+# routes to the agentic backend. Stub mode is automatic when
+# PERPLEXITY_API_KEY is unset.
+# ─────────────────────────────────────────────
+
+@app.route("/agent/status", methods=["GET"])
+def agent_status():
+    """Quick check: is Perplexity Computer connected? Is Anthropic key set?"""
+    return jsonify({
+        "perplexity_computer": {
+            "live": perplexity_client.is_live(),
+            "mode": "live" if perplexity_client.is_live() else "stub",
+        },
+        "claude": {
+            "live": claude_client.is_live(),
+            "mode": "live" if claude_client.is_live() else "stub",
+        },
+    })
+
+
+@app.route("/agent/computer_run", methods=["POST"])
+def agent_computer_run():
+    """
+    Generic Perplexity Computer pass-through.
+    Body: { "task": { "kind": ..., "input": ..., "constraints": ... }, "secret": ... }
+    Returns whatever perplexity_client.run_task returns.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+    task = data.get("task")
+    if not isinstance(task, dict) or "kind" not in task:
+        return jsonify({"error": "Invalid task — must be a dict with 'kind' field"}), 400
+
+    timeout_s = int(data.get("timeout_s", 60))
+    result = perplexity_client.run_task(task, timeout_s=timeout_s)
+    return jsonify(result)
+
+
+# ─────────────────────────────────────────────
+# V3 — Currency Watch (External Freshness)
+# Re-fetch a source via Perplexity Computer, classify the change with Claude,
+# return a verdict. Notification persistence is layered above this endpoint
+# (caller decides whether to write to a Notifications table + chat queue).
+# ─────────────────────────────────────────────
+
+@app.route("/freshness/check", methods=["POST"])
+def freshness_check():
+    """
+    Check whether a tracked source has materially changed since baseline.
+
+    Body: {
+      "source_url": "https://kubernetes.io/blog/...",
+      "baseline_text": "<previously cached main_text>",
+      "baseline_hash": "<sha256 of baseline_text>" (optional — recomputed if missing),
+      "context": { "concept_name": "...", "captured_at": "...", ... } (optional),
+      "secret": "..."
+    }
+
+    Returns: {
+      "changed": bool,
+      "category": "cosmetic|clarification|substantive|breaking",
+      "summary": "...",
+      "should_notify": bool,
+      "current_text": "<truncated>",
+      "current_hash": "...",
+      "fetched_at": "...",
+      "metadata": { computer + classifier metadata }
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+    source_url = data.get("source_url", "").strip()
+    baseline_text = data.get("baseline_text", "")
+    baseline_hash = data.get("baseline_hash") or ""
+    context = data.get("context", {}) or {}
+
+    if not source_url:
+        return jsonify({"error": "source_url is required"}), 400
+
+    # 1. Re-fetch via Perplexity Computer
+    fetch_result = perplexity_client.fetch_url(source_url)
+    if fetch_result.get("status") != "ok":
+        return jsonify({
+            "changed": False,
+            "category": "error",
+            "summary": "Could not re-fetch source.",
+            "should_notify": False,
+            "fetch_metadata": fetch_result,
+        }), 200  # Soft fail — caller can retry
+
+    fetched = fetch_result.get("result", {})
+    current_text = fetched.get("main_text", "")
+    current_hash = fetched.get("content_hash", "")
+
+    # 2. Cheap diff — if hashes match, skip the classifier entirely
+    if baseline_hash and baseline_hash == current_hash:
+        return jsonify({
+            "changed": False,
+            "category": "cosmetic",
+            "summary": "No change detected (content hash matches baseline).",
+            "should_notify": False,
+            "current_hash": current_hash,
+            "fetched_at": fetched.get("fetched_at"),
+            "metadata": {
+                "computer": fetch_result.get("metadata", {}),
+                "classifier": {"skipped": "hash_match"},
+            },
+        })
+
+    # 3. Substance classifier (Claude)
+    classification = claude_client.classify_change(
+        old_text=baseline_text,
+        new_text=current_text,
+        context=context,
+    )
+
+    category = classification.get("category", "cosmetic")
+    should_notify = category in ("substantive", "breaking")
+
+    return jsonify({
+        "changed": True,
+        "category": category,
+        "summary": classification.get("summary", ""),
+        "affected_concepts": classification.get("affected_concepts", []),
+        "confidence": classification.get("confidence", 0.0),
+        "should_notify": should_notify,
+        "current_text": current_text[:2000],  # truncate for response payload size
+        "current_hash": current_hash,
+        "fetched_at": fetched.get("fetched_at"),
+        "metadata": {
+            "computer": fetch_result.get("metadata", {}),
+            "classifier": {"_stub": classification.get("_stub", False)},
+        },
+    })
+
+
+@app.route("/freshness/scan", methods=["POST"])
+def freshness_scan():
+    """
+    Run a Currency Watch scan over a user's tracked concepts.
+
+    Body: { "user_id": str, "max_concepts": int (default 5), "secret": ... }
+
+    For each tracked concept, runs the freshness pipeline:
+      Perplexity Computer fetch_url → diff → Claude substance classify
+      → categorize cosmetic / clarification / substantive / breaking
+      → notify only on substantive + breaking
+
+    Returns: {
+      user_id, scanned_at, concepts_scanned, notifications_count,
+      verdicts: [...all scanned, with category + summary],
+      notifications: [...subset that warrant a chat surfacing],
+      modes: { computer: live|stub, classifier: live|stub }
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    data = request.json or {}
+    user_id = data.get("user_id")
+    max_concepts = int(data.get("max_concepts", 5))
+
+    result = freshness.run_scan(user_id=user_id, max_concepts=max_concepts)
+    return jsonify(result)
 
 
 # ─────────────────────────────────────────────

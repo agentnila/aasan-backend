@@ -15,3 +15,11 @@ services:
         sync: false
       - key: API_SECRET
         sync: false
+      # V3 — server-side Claude (substance classifier + concept extractor)
+      # Note: browser-side chat already uses VITE_ANTHROPIC_API_KEY in Vercel
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # V3 — Perplexity Computer (deep agentic web execution)
+      # When unset, services/perplexity_client.py runs in stub mode
+      - key: PERPLEXITY_API_KEY
+        sync: false
