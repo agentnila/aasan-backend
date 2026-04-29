@@ -1,6 +1,31 @@
-flask==3.0.0
-flask-cors==4.0.0
-neo4j==5.17.0
-mem0ai==0.1.29
-gunicorn==21.2.0
-requests==2.31.0
+# Aasan V3 Backend — Render.com deps
+# Install: pip install -r requirements.txt
+
+# Web framework
+flask>=3.0
+flask-cors>=4.0
+
+# Knowledge graph
+neo4j>=5.0
+
+# Persistent memory
+mem0ai>=0.1
+
+# HTTP — used by services/perplexity_client.py + services/claude_client.py
+requests>=2.31
+
+# Google Workspace APIs — Calendar + Gmail + Drive (V3)
+# Activates when GOOGLE_SERVICE_ACCOUNT_KEY + GOOGLE_WORKSPACE_DOMAIN env vars are set.
+# DWD scopes required at the Workspace Admin level:
+#   https://www.googleapis.com/auth/calendar
+#   https://www.googleapis.com/auth/gmail.send
+#   https://www.googleapis.com/auth/drive.readonly
+google-api-python-client>=2.100
+google-auth>=2.20
+
+# Vector index — Pinecone (V3 semantic search)
+# Activates when PINECONE_API_KEY + PINECONE_INDEX env vars are set.
+pinecone>=5.0
+
+# Production server (Render uses gunicorn)
+gunicorn>=21.0

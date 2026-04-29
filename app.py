@@ -12,6 +12,7 @@ Endpoints:
 7. /health        — Health check
 8. /agent/*       — V3 deep agentic layer (Perplexity Computer wrapper)
 9. /freshness/*   — V3 Currency Watch (uses /agent + Claude classifier)
+10. /calendar/*   — V3 Project Manager Mode (Google Calendar scheduling)
 
 Called by: React app (browser), the React app calls Render endpoints which
 in turn call Perplexity Computer (server-side) and Claude (server-side).
@@ -28,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -475,10 +476,85 @@ def content_add():
     data["indexed_at"] = datetime.utcnow().isoformat()
     content_index.append(data)
 
+    # ─── Vector index upsert (V3 semantic search) ─────────────────
+    # Embed the content + push to vector_index. Stub mode uses local
+    # cosine; live mode uses Voyage + Pinecone. Failures don't block.
+    try:
+        embed_text = " ".join(filter(None, [
+            data.get("title", ""),
+            data.get("ai_summary", ""),
+            " ".join(data.get("skills", []) or []),
+            " ".join(data.get("concepts_covered", []) or []),
+        ])).strip()
+        if embed_text:
+            vec = embeddings.embed_text(embed_text)
+            vector_index.upsert(data["content_id"], vec, {
+                "title": data.get("title"),
+                "source": data.get("source"),
+                "source_url": data.get("source_url"),
+                "content_type": data.get("content_type") or data.get("type"),
+                "duration_minutes": data.get("duration_minutes"),
+                "difficulty": data.get("difficulty"),
+                "skills": data.get("skills") or [],
+                "concepts_covered": data.get("concepts_covered") or [],
+            })
+    except Exception as exc:
+        print(f"[/content/add] vector upsert failed: {exc}")
+
+    # ─── Path Engine trigger: content_added ─────────────────────
+    # Optional. Caller passes target_user_id + target_goal_id to attribute
+    # the new content to a specific path. The high-relevance check is
+    # downstream in the engine prompt — this just delivers the signal.
+    path_update = None
+    target_user = data.get("target_user_id")
+    target_goal = data.get("target_goal_id")
+    if target_user:
+        try:
+            target_goal = target_goal or path_engine.primary_goal_id(target_user)
+            if target_goal:
+                path_update = path_engine.recompute(
+                    target_user, target_goal, "content_added",
+                    {"content_id": data["content_id"], "title": data.get("title"),
+                     "skills": data.get("skills", []), "concepts_covered": data.get("concepts_covered", [])},
+                )
+        except Exception as exc:
+            path_update = {"error": f"path engine trigger failed: {exc}"}
+
     return jsonify({
         "status": "ok",
         "content_id": data["content_id"],
-        "total_indexed": len(content_index)
+        "total_indexed": len(content_index),
+        "vector_count": vector_index.count(),
+        "path_update": path_update,
+    })
+
+
+@app.route("/content/semantic_search", methods=["POST"])
+def content_semantic_search():
+    """
+    Semantic search over the vector index. Embeds the query, queries
+    Pinecone (or in-memory cosine in stub mode), returns top-K hits with
+    metadata + score.
+
+    Body: { query: str, top_k?: int (default 5), filter?: dict }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    query = (data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query required"}), 400
+    top_k = int(data.get("top_k", 5))
+    filt = data.get("filter")
+
+    vec = embeddings.embed_text(query)
+    matches = vector_index.query(vec, top_k=top_k, filter=filt)
+    return jsonify({
+        "query": query,
+        "matches": matches,
+        "modes": {"embeddings": "live" if embeddings.is_live() else "stub",
+                  "vector_index": "live" if vector_index.is_live() else "stub"},
+        "top_k": top_k,
     })
 
 
@@ -640,10 +716,34 @@ def capture_session():
         except Exception as e:
             return jsonify({"error": f"Mem0 error: {str(e)}"}), 500
 
+    # ─── Path Engine trigger: session_complete ───────────────────
+    # If the caller passes path_step_id, mark that step done with the
+    # captured mastery + actual duration before recompute. Otherwise just
+    # recompute the user's primary path on the session signal.
+    path_update = None
+    try:
+        step_id = data.get("path_step_id")
+        goal_id = data.get("goal_id") or path_engine.find_step_owner(user_id, step_id) if step_id else (data.get("goal_id") or path_engine.primary_goal_id(user_id))
+        avg_mastery = None
+        if data.get("concepts"):
+            scores = [c.get("confidence") for c in data["concepts"] if c.get("confidence") is not None]
+            if scores:
+                avg_mastery = sum(scores) / len(scores)
+        if step_id and goal_id:
+            path_engine.mark_step_done(user_id, goal_id, step_id, mastery=avg_mastery, duration_minutes=data.get("duration_minutes"))
+        if goal_id:
+            path_update = path_engine.recompute(
+                user_id, goal_id, "session_complete",
+                {"step_id": step_id, "session_title": data.get("session_title"), "gaps": data.get("gaps", []), "mastery": avg_mastery},
+            )
+    except Exception as exc:
+        path_update = {"error": f"path engine trigger failed: {exc}"}
+
     return jsonify({
         "status": "ok",
         "concepts_saved": concepts_saved,
-        "memories_added": memories_added
+        "memories_added": memories_added,
+        "path_update": path_update,
     })
 
 
@@ -844,6 +944,24 @@ def context_load():
     # Get content count
     result["content_indexed"] = len(content_index)
 
+    # V3 — Project Manager Mode: upcoming Schedule_Blocks + just-fired nudges.
+    # Lets ContextPanel render "Next learning block: Today 2:30 PM — Service Mesh"
+    # and the chat composer surface conflict_pending blocks in the next greeting.
+    now_iso = datetime.utcnow().isoformat()
+    user_blocks = [b for b in SCHEDULE_BLOCKS if b["employee_id"] == user_id]
+    upcoming = sorted(
+        [b for b in user_blocks if b["status"] in ("scheduled", "rescheduled") and b["end_at"] > now_iso],
+        key=lambda b: b["start_at"],
+    )
+    conflict_pending = [b for b in user_blocks if b["status"] == "conflict_pending"]
+    recent_nudges = [n for n in NUDGE_LOG if n["employee_id"] == user_id][-5:]
+    result["schedule"] = {
+        "upcoming": upcoming[:5],
+        "next_block_at": upcoming[0]["start_at"] if upcoming else None,
+        "conflict_pending": conflict_pending,
+        "recent_nudges": recent_nudges,
+    }
+
     return jsonify(result)
 
 
@@ -1012,6 +1130,26 @@ def freshness_check():
     category = classification.get("category", "cosmetic")
     should_notify = category in ("substantive", "breaking")
 
+    # ─── Path Engine trigger: staleness_flag ────────────────────
+    # Only fire the engine on substantive/breaking changes. Caller passes
+    # target_user_id + target_goal_id so the right path gets the refresher.
+    path_update = None
+    if should_notify:
+        target_user = data.get("target_user_id") or context.get("user_id")
+        target_goal = data.get("target_goal_id") or context.get("goal_id")
+        if target_user:
+            try:
+                target_goal = target_goal or path_engine.primary_goal_id(target_user)
+                if target_goal:
+                    path_update = path_engine.recompute(
+                        target_user, target_goal, "staleness_flag",
+                        {"source_url": source_url, "category": category,
+                         "summary": classification.get("summary", ""),
+                         "affected_concepts": classification.get("affected_concepts", [])},
+                    )
+            except Exception as exc:
+                path_update = {"error": f"path engine trigger failed: {exc}"}
+
     return jsonify({
         "changed": True,
         "category": category,
@@ -1026,6 +1164,7 @@ def freshness_check():
             "computer": fetch_result.get("metadata", {}),
             "classifier": {"_stub": classification.get("_stub", False)},
         },
+        "path_update": path_update,
     })
 
 
@@ -1191,6 +1330,131 @@ def path_recompute():
     return jsonify(path_engine.recompute(user_id, goal_id, trigger, payload))
 
 
+@app.route("/goal/create", methods=["POST"])
+def goal_create():
+    """
+    Create a new goal + empty path. Body: { user_id, goal: {name, priority?,
+    objective?, timeline?, success_criteria?, readiness?} }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_input = data.get("goal") or {}
+    if not goal_input.get("name"):
+        return jsonify({"error": "goal.name required"}), 400
+    return jsonify(path_engine.create_goal(user_id, goal_input))
+
+
+@app.route("/goal/archive", methods=["POST"])
+def goal_archive():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    if not goal_id:
+        return jsonify({"error": "goal_id required"}), 400
+    return jsonify(path_engine.archive_goal(user_id, goal_id))
+
+
+@app.route("/goal/update_progress", methods=["POST"])
+def goal_update_progress():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    if not goal_id:
+        return jsonify({"error": "goal_id required"}), 400
+    return jsonify(path_engine.update_goal_progress(
+        user_id, goal_id,
+        readiness=data.get("readiness"),
+        delta=data.get("delta"),
+    ))
+
+
+@app.route("/path/reorder", methods=["POST"])
+def path_reorder():
+    """Manual learner edit — move a step. Marks the step inserted_by=learner."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    step_id = data.get("step_id")
+    new_order = data.get("new_order")
+    if not (goal_id and step_id and new_order is not None):
+        return jsonify({"error": "goal_id, step_id, new_order required"}), 400
+    return jsonify(path_engine.reorder_step(user_id, goal_id, step_id, new_order))
+
+
+@app.route("/path/skip_step", methods=["POST"])
+def path_skip_step():
+    """Manual learner edit — skip a step. Engine never unskips."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    step_id = data.get("step_id")
+    if not (goal_id and step_id):
+        return jsonify({"error": "goal_id, step_id required"}), 400
+    return jsonify(path_engine.skip_step(user_id, goal_id, step_id, reason=data.get("reason", "")))
+
+
+@app.route("/path/mark_done", methods=["POST"])
+def path_mark_done():
+    """Mark a step done with optional mastery + duration. Used by capture flow + manual."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    goal_id = data.get("goal_id")
+    step_id = data.get("step_id")
+    if not (goal_id and step_id):
+        return jsonify({"error": "goal_id, step_id required"}), 400
+    return jsonify(path_engine.mark_step_done(
+        user_id, goal_id, step_id,
+        mastery=data.get("mastery"),
+        duration_minutes=data.get("duration_minutes"),
+    ))
+
+
+@app.route("/assignment/create", methods=["POST"])
+def assignment_create():
+    """
+    Manager assigns content into a learner's path. Triggers the Path
+    Adjustment Engine with assignment_create — engine inserts the new
+    step, marked inserted_by=manager.
+
+    Body: { user_id (learner), goal_id?, manager?, title, source?, url?,
+            estimated_minutes?, due_at? }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id")
+    if not user_id or not data.get("title"):
+        return jsonify({"error": "user_id and title required"}), 400
+    goal_id = data.get("goal_id") or path_engine.primary_goal_id(user_id)
+    if not goal_id:
+        return jsonify({"error": f"no active goal for user {user_id} — create one first"}), 400
+    path_engine.queue_assignment(user_id, {
+        "title": data["title"],
+        "source": data.get("source"),
+        "url": data.get("url"),
+        "estimated_minutes": data.get("estimated_minutes", 30),
+        "manager": data.get("manager"),
+        "due_at": data.get("due_at"),
+    })
+    result = path_engine.recompute(
+        user_id, goal_id, "assignment_create",
+        {"assignments": path_engine.drain_assignments(user_id)},
+    )
+    return jsonify(result)
+
+
 @app.route("/path/insert_step", methods=["POST"])
 def path_insert_step():
     """
@@ -1347,6 +1611,541 @@ def resume_tailor():
     if not job_url and not job_description:
         return jsonify({"error": "job_url or job_description required"}), 400
     return jsonify(resume.tailor_resume(user_id=user_id, job_url=job_url, job_description=job_description))
+
+
+# ─────────────────────────────────────────────
+# V3 — Drive connector (Workspace training-content ingest)
+# Walks Drive (live or stub), classifies each file via Claude (or keyword
+# stub), embeds, upserts to vector_index, appends to content_index.
+# ─────────────────────────────────────────────
+
+@app.route("/drive/index", methods=["POST"])
+def drive_index():
+    """
+    One-shot ingest run.
+
+    Body: { folder_id?: str, query?: str, limit?: int (default 25),
+            target_user_id?: str (for path-engine content_added trigger),
+            target_goal_id?: str }
+
+    Returns: { ingested: [...], failed: [...], counts: {...},
+               modes: {drive, classifier, embeddings, vector_index} }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    folder_id = data.get("folder_id")
+    query = data.get("query")
+    limit = int(data.get("limit", 25))
+    target_user = data.get("target_user_id")
+    target_goal = data.get("target_goal_id")
+
+    files = drive_connector.list_training_files(query=query, folder_id=folder_id, limit=limit)
+    ingested = []
+    failed = []
+    for f in files:
+        try:
+            text = drive_connector.fetch_file_text(f["file_id"], f["mime_type"])
+            classification = content_classifier.classify_content(
+                title=f["title"], text=text, source="google-drive", source_url=f.get("url", ""),
+            )
+            content_item = {
+                "content_id": f"drive-{f['file_id']}",
+                "title": f["title"],
+                "source": "google-drive",
+                "source_url": f.get("url"),
+                "content_type": classification.get("content_type", "doc"),
+                "duration_minutes": classification.get("duration_minutes_estimate", 5),
+                "difficulty": classification.get("difficulty", "intermediate"),
+                "skills": classification.get("skills", []),
+                "concepts_covered": classification.get("concepts_covered", []),
+                "prerequisites": classification.get("prerequisites", []),
+                "ai_summary": classification.get("summary", ""),
+                "quality_score": classification.get("quality_score", 0.6),
+                "owner": f.get("owner"),
+                "modified_time": f.get("modified_time"),
+                "indexed_at": datetime.utcnow().isoformat(),
+                "_classifier_mode": classification.get("_mode"),
+            }
+            # Skip duplicates (re-runs of /drive/index on same files)
+            content_index[:] = [c for c in content_index if c.get("content_id") != content_item["content_id"]]
+            content_index.append(content_item)
+
+            # Embed + index
+            embed_text_blob = " ".join(filter(None, [
+                content_item["title"], content_item["ai_summary"],
+                " ".join(content_item["skills"]),
+                " ".join(content_item["concepts_covered"]),
+                text[:2000],
+            ]))
+            vec = embeddings.embed_text(embed_text_blob)
+            vector_index.upsert(content_item["content_id"], vec, {
+                "title": content_item["title"], "source": content_item["source"],
+                "source_url": content_item["source_url"],
+                "content_type": content_item["content_type"],
+                "duration_minutes": content_item["duration_minutes"],
+                "difficulty": content_item["difficulty"],
+                "skills": content_item["skills"],
+                "concepts_covered": content_item["concepts_covered"],
+            })
+            ingested.append({"content_id": content_item["content_id"], "title": content_item["title"],
+                             "skills": content_item["skills"], "difficulty": content_item["difficulty"]})
+        except Exception as exc:
+            failed.append({"file_id": f.get("file_id"), "title": f.get("title"), "error": str(exc)})
+
+    # Path Engine trigger: content_added (one batch trigger per recompute,
+    # not per file — avoids 25 separate recompute calls)
+    path_update = None
+    if target_user and ingested:
+        try:
+            target_goal = target_goal or path_engine.primary_goal_id(target_user)
+            if target_goal:
+                path_update = path_engine.recompute(
+                    target_user, target_goal, "content_added",
+                    {"batch_size": len(ingested), "sample_titles": [i["title"] for i in ingested[:3]]},
+                )
+        except Exception as exc:
+            path_update = {"error": f"path engine trigger failed: {exc}"}
+
+    return jsonify({
+        "ingested": ingested,
+        "failed": failed,
+        "counts": {"ingested": len(ingested), "failed": len(failed),
+                   "content_index_total": len(content_index),
+                   "vector_index_total": vector_index.count()},
+        "modes": {
+            "drive": "live" if drive_connector.is_connected() else "stub",
+            "classifier": "live" if content_classifier.is_live() else "stub",
+            "embeddings": "live" if embeddings.is_live() else "stub",
+            "vector_index": "live" if vector_index.is_live() else "stub",
+        },
+        "path_update": path_update,
+    })
+
+
+# ─────────────────────────────────────────────
+# V3 — Project Manager Mode (Calendar scheduling)
+# Solution Arch §14.A. Endpoints: /calendar/find_slots, /calendar/book,
+# /calendar/reschedule, /calendar/cancel.
+#
+# Phase 1 storage: in-memory SCHEDULE_BLOCKS list (Schedule_Blocks Table 18
+# schema). Phase 2: migrate to Airtable. Phase B (next session): wire real
+# Google Calendar OAuth — calendar_client returns stub busy windows for now.
+# ─────────────────────────────────────────────
+
+SCHEDULE_BLOCKS = []  # Phase 1 in-memory store; Phase 2 → Airtable Table 18
+NUDGE_LOG = []         # Phase 1 in-memory log of dispatched 5-min-prior nudges
+_BLOCK_ID_COUNTER = [0]
+
+
+def _next_block_id():
+    _BLOCK_ID_COUNTER[0] += 1
+    return _BLOCK_ID_COUNTER[0]
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+@app.route("/calendar/find_slots", methods=["POST"])
+def calendar_find_slots():
+    """
+    Find candidate learning slots in the learner's calendar.
+
+    Body:
+      { user_id, duration_min: 30, count: 3,
+        window_start?: ISO, window_end?: ISO,
+        rhythm?: "morning"|"afternoon"|"evening"|"default" }
+
+    Returns: { slots: [{day, time, fit, start, end, score}, ...],
+               connected: bool, rhythm: str }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    duration_min = int(data.get("duration_min", 30))
+    count = int(data.get("count", 3))
+    rhythm = data.get("rhythm", "default")
+    window_start = _parse_iso(data.get("window_start"))
+    window_end = _parse_iso(data.get("window_end"))
+    goals = data.get("goals")  # V3 multi-goal: optional list of {goal_id, name, priority, deadline, progress_pct}
+
+    slots = scheduler.compute_free_slots(
+        user_id=user_id,
+        duration_min=duration_min,
+        count=count,
+        window_start=window_start,
+        window_end=window_end,
+        rhythm=rhythm,
+        goals=goals,
+    )
+    response = {
+        "slots": slots,
+        "connected": calendar_client.is_connected(),
+        "rhythm": rhythm,
+        "duration_min": duration_min,
+    }
+    if goals:
+        response["goal_budget"] = scheduler.compute_goal_budget(goals)
+    return jsonify(response)
+
+
+@app.route("/calendar/goal_budget", methods=["POST"])
+def calendar_goal_budget():
+    """
+    Goals Dashboard — return weighted minutes-per-week per goal.
+    Body: { goals: [{goal_id, name, priority, deadline, progress_pct}],
+            total_minutes_per_week?: 300 }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    goals = data.get("goals", [])
+    total = int(data.get("total_minutes_per_week", 300))
+    return jsonify({"budget": scheduler.compute_goal_budget(goals, total_minutes_per_week=total)})
+
+
+@app.route("/calendar/book", methods=["POST"])
+def calendar_book():
+    """
+    Book a slot. Creates a Calendar event + Schedule_Blocks row + schedules
+    the 5-min-prior nudge.
+
+    Body:
+      { user_id, path_step_id?, step_title, start_at: ISO, end_at: ISO,
+        description? }
+
+    Returns: { block_id, calendar_event_id, calendar_event_url, scheduled_at,
+               nudge_at, status }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    path_step_id = data.get("path_step_id")
+    step_title = data.get("step_title", "Learning session")
+    start_at = _parse_iso(data.get("start_at"))
+    end_at = _parse_iso(data.get("end_at"))
+    description = data.get("description", "")
+    if not start_at or not end_at:
+        return jsonify({"error": "start_at and end_at required (ISO 8601)"}), 400
+
+    event = calendar_client.insert_event(
+        user_id=user_id,
+        title=f"📚 Aasan — {step_title}",
+        start=start_at,
+        end=end_at,
+        description=description or f"Aasan learning session: {step_title}",
+    )
+
+    block = {
+        "block_id": _next_block_id(),
+        "employee_id": user_id,
+        "path_step_id": path_step_id,
+        "step_title": step_title,
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
+        "duration_minutes": int((end_at - start_at).total_seconds() // 60),
+        "calendar_event_id": event["event_id"],
+        "calendar_event_url": event["event_url"],
+        "status": "scheduled",
+        "nudge_at": (start_at - timedelta(minutes=5)).isoformat(),
+        "nudge_sent_at": None,
+        "reschedule_count": 0,
+        "original_start_at": start_at.isoformat(),
+        "created_at": datetime.utcnow().isoformat(),
+        "mode": event.get("mode", "live"),
+    }
+    SCHEDULE_BLOCKS.append(block)
+
+    return jsonify({
+        "block_id": block["block_id"],
+        "calendar_event_id": block["calendar_event_id"],
+        "calendar_event_url": block["calendar_event_url"],
+        "scheduled_at": block["start_at"],
+        "nudge_at": block["nudge_at"],
+        "status": block["status"],
+        "mode": block["mode"],
+    })
+
+
+@app.route("/calendar/reschedule", methods=["POST"])
+def calendar_reschedule():
+    """
+    Two modes:
+      1. Walk-mode: { user_id } → returns blocks that conflict with
+         freshly-fetched busy windows (used by daily cron). Does NOT push;
+         conflicts are surfaced in next chat session.
+      2. Move-mode: { block_id, new_start_at, new_end_at } → moves the event.
+
+    Returns: { conflicts: [...], moved?: {block_id, ...} }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+
+    block_id = data.get("block_id")
+    if block_id is not None:
+        new_start = _parse_iso(data.get("new_start_at"))
+        new_end = _parse_iso(data.get("new_end_at"))
+        if not new_start or not new_end:
+            return jsonify({"error": "new_start_at and new_end_at required"}), 400
+        block = next((b for b in SCHEDULE_BLOCKS if b["block_id"] == block_id), None)
+        if not block:
+            return jsonify({"error": f"block {block_id} not found"}), 404
+        calendar_client.delete_event(block["employee_id"], block["calendar_event_id"])
+        event = calendar_client.insert_event(
+            user_id=block["employee_id"],
+            title=f"📚 Aasan — {block['step_title']}",
+            start=new_start,
+            end=new_end,
+        )
+        block["start_at"] = new_start.isoformat()
+        block["end_at"] = new_end.isoformat()
+        block["calendar_event_id"] = event["event_id"]
+        block["calendar_event_url"] = event["event_url"]
+        block["nudge_at"] = (new_start - timedelta(minutes=5)).isoformat()
+        block["nudge_sent_at"] = None
+        block["reschedule_count"] = block.get("reschedule_count", 0) + 1
+        block["status"] = "rescheduled"
+        return jsonify({"moved": block, "conflicts": []})
+
+    # Walk mode: detect conflicts for this user's active blocks
+    user_id = data.get("user_id", "demo-user")
+    active = [b for b in SCHEDULE_BLOCKS if b["employee_id"] == user_id and b["status"] in ("scheduled", "rescheduled")]
+    if not active:
+        return jsonify({"conflicts": []})
+    starts = [_parse_iso(b["start_at"]) for b in active]
+    ends = [_parse_iso(b["end_at"]) for b in active]
+    busy = calendar_client.list_busy_windows(user_id, min(starts), max(ends) + timedelta(hours=1))
+    conflicts = scheduler.detect_conflicts(active, busy)
+    return jsonify({"conflicts": conflicts})
+
+
+@app.route("/calendar/cancel", methods=["POST"])
+def calendar_cancel():
+    """
+    Cancel a booked block. Deletes the Calendar event and marks the
+    Schedule_Block as cancelled.
+
+    Body: { block_id }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    block_id = data.get("block_id")
+    if block_id is None:
+        return jsonify({"error": "block_id required"}), 400
+    block = next((b for b in SCHEDULE_BLOCKS if b["block_id"] == block_id), None)
+    if not block:
+        return jsonify({"error": f"block {block_id} not found"}), 404
+    calendar_client.delete_event(block["employee_id"], block["calendar_event_id"])
+    block["status"] = "cancelled"
+    return jsonify({"ok": True, "block": block})
+
+
+@app.route("/calendar/blocks", methods=["POST"])
+def calendar_blocks():
+    """List a learner's active Schedule_Blocks. Used by Goals Dashboard."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    include_past = bool(data.get("include_past", False))
+    blocks = [b for b in SCHEDULE_BLOCKS if b["employee_id"] == user_id]
+    if not include_past:
+        blocks = [b for b in blocks if b["status"] in ("scheduled", "rescheduled")]
+    return jsonify({"blocks": blocks, "count": len(blocks)})
+
+
+# ─────────────────────────────────────────────
+# V3 — Calendar cron endpoints
+# Render Cron Jobs hit these on schedule. Both are idempotent and safe to
+# re-run; both return summary JSON for monitoring.
+#
+# Suggested schedules (configure in Render dashboard or render.yaml):
+#   /cron/calendar_nudges  — every 1 minute (catches each block's 5-min-prior window)
+#   /cron/calendar_walk    — once per hour (rescans all active blocks for new conflicts)
+# ─────────────────────────────────────────────
+
+@app.route("/cron/calendar_nudges", methods=["POST", "GET"])
+def cron_calendar_nudges():
+    """
+    Dispatch 5-min-prior nudges. Scans SCHEDULE_BLOCKS for blocks where
+    nudge_at <= now AND nudge_sent_at IS NULL AND status in (scheduled, rescheduled).
+    For each, marks nudge_sent_at and appends a notification log row.
+
+    Phase B-this-session: log only (notification dispatcher is stubbed —
+    real email/web push is Phase C).
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    now = datetime.utcnow()
+    dispatched = []
+    for block in SCHEDULE_BLOCKS:
+        if block["status"] not in ("scheduled", "rescheduled"):
+            continue
+        if block.get("nudge_sent_at"):
+            continue
+        nudge_at = datetime.fromisoformat(block["nudge_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        if nudge_at > now:
+            continue
+        # Skip nudges that are stale (more than 30 min past) — start time has come and gone
+        start_at = datetime.fromisoformat(block["start_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+        if (now - start_at).total_seconds() > 1800:
+            block["status"] = "missed"
+            continue
+        block["nudge_sent_at"] = now.isoformat()
+        nudge_payload = {
+            "block_id": block["block_id"],
+            "employee_id": block["employee_id"],
+            "step_title": block["step_title"],
+            "start_at": block["start_at"],
+            "dispatched_at": now.isoformat(),
+        }
+        # Phase C: real dispatch via notifications.py (Gmail + Slack).
+        # Returns per-channel {ok, mode, error?} — failures don't block the
+        # nudge_sent_at marker; they're recorded for observability.
+        channel_results = notifications.dispatch_nudge(nudge_payload)
+        NUDGE_LOG.append({
+            **nudge_payload,
+            "channels": channel_results,
+            "channel": "+".join(c for c, r in channel_results.items() if r.get("ok")) or "log",
+        })
+        dispatched.append(block["block_id"])
+
+    return jsonify({
+        "dispatched": dispatched,
+        "count": len(dispatched),
+        "scanned": len(SCHEDULE_BLOCKS),
+        "ran_at": now.isoformat(),
+    })
+
+
+@app.route("/cron/calendar_walk", methods=["POST", "GET"])
+def cron_calendar_walk():
+    """
+    Daily reschedule walk. For every user with active blocks, refetch their
+    Calendar busy windows and detect blocks that now overlap a meeting that
+    wasn't there at booking time. Marks block.status = 'conflict_pending'
+    so the next chat session can surface a reschedule prompt.
+
+    Does NOT push notifications and does NOT auto-reschedule. The learner
+    sees the conflict in their next greeting and chooses.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    by_user = {}
+    for b in SCHEDULE_BLOCKS:
+        if b["status"] in ("scheduled", "rescheduled"):
+            by_user.setdefault(b["employee_id"], []).append(b)
+
+    flagged = []
+    for user_id, blocks in by_user.items():
+        starts = [datetime.fromisoformat(b["start_at"].replace("Z", "+00:00")) for b in blocks]
+        ends = [datetime.fromisoformat(b["end_at"].replace("Z", "+00:00")) for b in blocks]
+        if not starts:
+            continue
+        busy = calendar_client.list_busy_windows(user_id, min(starts), max(ends) + timedelta(hours=1))
+        conflicts = scheduler.detect_conflicts(blocks, busy)
+        for c in conflicts:
+            target = next((b for b in SCHEDULE_BLOCKS if b["block_id"] == c["block_id"]), None)
+            if target and target["status"] != "conflict_pending":
+                target["status"] = "conflict_pending"
+                target["conflict_with"] = c.get("conflict_with")
+                flagged.append(target["block_id"])
+
+    return jsonify({
+        "flagged": flagged,
+        "count": len(flagged),
+        "users_scanned": len(by_user),
+        "ran_at": datetime.utcnow().isoformat(),
+    })
+
+
+@app.route("/calendar/nudges", methods=["POST"])
+def calendar_nudges():
+    """
+    Read endpoint — frontend calls this on context load to display
+    'just dispatched' nudges (the ones the cron fired since last load).
+    Returns the most-recent N for the user.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    limit = int(data.get("limit", 10))
+    user_nudges = [n for n in NUDGE_LOG if n["employee_id"] == user_id]
+    return jsonify({"nudges": user_nudges[-limit:], "count": len(user_nudges)})
+
+
+# ─────────────────────────────────────────────
+# V3 — Work_Items (granular build-task tracker)
+# Companion to JOURNAL.md. JOURNAL.md = narrative ship log (~10/quarter).
+# Work_Items = granular tasks (~hundreds), with status transitions.
+# Phase 1 in-memory; Phase 2 → Airtable Table 26.
+# ─────────────────────────────────────────────
+
+@app.route("/work_item/create", methods=["POST"])
+def work_item_create():
+    """
+    Body: { title (required), status?, description?, owner?, parent_ship_date?,
+            tags?: list[str], estimated_minutes?, actual_minutes? }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    title = data.pop("title", None)
+    if not title:
+        return jsonify({"error": "title required"}), 400
+    return jsonify(work_items.create(title, **data))
+
+
+@app.route("/work_item/update", methods=["POST"])
+def work_item_update():
+    """Body: { work_item_id, ...fields }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    item_id = data.pop("work_item_id", None)
+    if item_id is None:
+        return jsonify({"error": "work_item_id required"}), 400
+    return jsonify(work_items.update(item_id, **data))
+
+
+@app.route("/work_item/get", methods=["POST"])
+def work_item_get():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    item_id = data.get("work_item_id")
+    if item_id is None:
+        return jsonify({"error": "work_item_id required"}), 400
+    return jsonify(work_items.get(item_id))
+
+
+@app.route("/work_item/list", methods=["POST"])
+def work_item_list():
+    """
+    Body: { status?, tag?, owner?, parent_ship_date?, limit?: int=100,
+            include_deleted?: bool=false }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(work_items.list_items(
+        status=data.get("status"),
+        tag=data.get("tag"),
+        owner=data.get("owner"),
+        parent_ship_date=data.get("parent_ship_date"),
+        limit=int(data.get("limit", 100)),
+        include_deleted=bool(data.get("include_deleted", False)),
+    ))
 
 
 # ─────────────────────────────────────────────

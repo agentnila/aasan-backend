@@ -148,11 +148,117 @@ def _seed_paths():
 # In-memory store: { user_id: { goal_id: { goal: {...}, path: {...} } } }
 _STORE = {}
 
+# Manager-assigned content waiting to be applied — flushed by recompute.
+_ASSIGNMENT_QUEUE = {}  # { user_id: [{title, source, url, assigned_by, ...}, ...] }
+
 
 def _ensure_user(user_id: str):
+    """
+    Demo-user gets the 3-goal seed for the canned product story.
+    Everyone else starts empty — goals come from /goal/create.
+    """
     if user_id not in _STORE:
-        _STORE[user_id] = _seed_paths()
+        if user_id == "demo-user":
+            _STORE[user_id] = _seed_paths()
+        else:
+            _STORE[user_id] = {}
     return _STORE[user_id]
+
+
+def _slugify(name: str) -> str:
+    import re
+    s = re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+    return s or f"goal-{int(datetime.utcnow().timestamp())}"
+
+
+# ──────────────────────────────────────────────────────────────
+# Goal CRUD
+# ──────────────────────────────────────────────────────────────
+
+def create_goal(user_id: str, goal_input: dict) -> dict:
+    """
+    Create a goal + an empty live path. Goal_input fields:
+      name (required), priority (primary|secondary|exploration|assigned),
+      objective, timeline (ISO date | label), success_criteria,
+      readiness (0–100, default 0).
+    Returns the new goal + path entry. Idempotent on goal_id collision —
+    re-creating the same goal_id updates the goal fields, leaves path intact.
+    """
+    user_data = _ensure_user(user_id)
+    name = (goal_input.get("name") or "").strip()
+    if not name:
+        return {"error": "goal name is required"}
+
+    goal_id = goal_input.get("id") or _slugify(name)
+    now = datetime.utcnow().isoformat()
+    if goal_id in user_data:
+        # Update existing
+        user_data[goal_id]["goal"].update({k: v for k, v in goal_input.items() if k != "id"})
+        return {"goal_id": goal_id, "goal": user_data[goal_id]["goal"], "path": user_data[goal_id]["path"], "created": False}
+
+    goal = {
+        "id": goal_id,
+        "name": name,
+        "priority": goal_input.get("priority", "primary"),
+        "objective": goal_input.get("objective", ""),
+        "timeline": goal_input.get("timeline", ""),
+        "days_left": goal_input.get("days_left"),
+        "success_criteria": goal_input.get("success_criteria", ""),
+        "readiness": int(goal_input.get("readiness") or 0),
+        "delta": goal_input.get("delta", "new"),
+        "status": "active",
+        "created_at": now,
+    }
+    path = {
+        "id": f"path-{goal_id}",
+        "title": f"Path to {name}",
+        "progress_pct": 0,
+        "current_step_id": None,
+        "estimated_total_minutes": 0,
+        "last_recompute_reason": "Path created — empty until first session or content match.",
+        "last_recomputed_at": now,
+        "recompute_history": [],
+        "steps": [],
+    }
+    user_data[goal_id] = {"goal": goal, "path": path}
+    return {"goal_id": goal_id, "goal": goal, "path": path, "created": True}
+
+
+def archive_goal(user_id: str, goal_id: str) -> dict:
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return {"error": f"goal {goal_id} not found"}
+    user_data[goal_id]["goal"]["status"] = "archived"
+    user_data[goal_id]["goal"]["archived_at"] = datetime.utcnow().isoformat()
+    return {"goal_id": goal_id, "status": "archived"}
+
+
+def update_goal_progress(user_id: str, goal_id: str, readiness: int = None, delta: str = None) -> dict:
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return {"error": f"goal {goal_id} not found"}
+    g = user_data[goal_id]["goal"]
+    if readiness is not None:
+        prev = g.get("readiness", 0)
+        g["readiness"] = max(0, min(100, int(readiness)))
+        g["delta"] = delta or (f"+{g['readiness'] - prev} this update" if g['readiness'] != prev else "no change")
+    elif delta:
+        g["delta"] = delta
+    return {"goal_id": goal_id, "goal": g}
+
+
+def queue_assignment(user_id: str, assignment: dict) -> dict:
+    """
+    Manager assigns content. Queued for the next recompute(assignment_create).
+    Returns {queued: bool, queue_size: int}.
+    """
+    q = _ASSIGNMENT_QUEUE.setdefault(user_id, [])
+    q.append({**assignment, "queued_at": datetime.utcnow().isoformat()})
+    return {"queued": True, "queue_size": len(q)}
+
+
+def drain_assignments(user_id: str) -> list:
+    return _ASSIGNMENT_QUEUE.pop(user_id, [])
 
 
 def list_goals(user_id: str) -> dict:
@@ -291,11 +397,24 @@ def recompute(user_id: str, goal_id: str, trigger: str, trigger_payload: dict = 
     # 5. Recompute progress + current step
     _recompute_progress(path)
 
+    # 6. Bounded-change rule — flag diffs that touch >30% of pending steps
+    pending_count = max(1, sum(1 for s in path["steps"] if s["status"] == "pending"))
+    touched = (
+        len(diff.get("added", []) or [])
+        + len(diff.get("modified", []) or [])
+        + len(diff.get("removed", []) or [])
+        + len(diff.get("reordered", []) or [])
+    )
+    change_pct = round(touched / pending_count, 3)
+    requires_confirmation = change_pct > 0.30
+
     return {
         "goal_id": goal_id,
         "goal_name": entry["goal"]["name"],
         "trigger": trigger,
         "diff": diff,
+        "change_pct": change_pct,
+        "requires_confirmation": requires_confirmation,
         "path_after": {
             "progress_pct": path["progress_pct"],
             "current_step_id": path["current_step_id"],
@@ -305,6 +424,97 @@ def recompute(user_id: str, goal_id: str, trigger: str, trigger_payload: dict = 
         "recomputed_at": now,
         "mode": "live" if claude_client.is_live() else "stub",
     }
+
+
+def primary_goal_id(user_id: str):
+    """Return the user's primary active goal_id, or None."""
+    user_data = _ensure_user(user_id)
+    primary = next(
+        (gid for gid, e in user_data.items()
+         if e["goal"].get("priority") == "primary" and e["goal"].get("status") == "active"),
+        None,
+    )
+    if primary:
+        return primary
+    return next(
+        (gid for gid, e in user_data.items() if e["goal"].get("status") == "active"),
+        None,
+    )
+
+
+def find_step_owner(user_id: str, step_id: str):
+    """Walk all goals; return goal_id that owns step_id (or None)."""
+    user_data = _ensure_user(user_id)
+    for gid, entry in user_data.items():
+        if any(s["id"] == step_id for s in entry["path"]["steps"]):
+            return gid
+    return None
+
+
+def mark_step_done(user_id: str, goal_id: str, step_id: str, mastery: float = None, duration_minutes: int = None) -> dict:
+    """
+    Used by trigger wiring after /capture/session. Marks the step done with
+    mastery + actual duration. Auto-advances current_step_id.
+    """
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return {"error": f"goal {goal_id} not found"}
+    path = user_data[goal_id]["path"]
+    step = next((s for s in path["steps"] if s["id"] == step_id), None)
+    if not step:
+        return {"error": f"step {step_id} not found"}
+    step["status"] = "done"
+    step["completed_at"] = datetime.utcnow().isoformat()[:10]
+    if mastery is not None:
+        step["mastery_at_completion"] = round(float(mastery), 2)
+    if duration_minutes is not None:
+        step["actual_minutes"] = int(duration_minutes)
+    _recompute_progress(path)
+    return {"goal_id": goal_id, "step_id": step_id, "status": "done", "progress_pct": path["progress_pct"]}
+
+
+def skip_step(user_id: str, goal_id: str, step_id: str, reason: str = "") -> dict:
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return {"error": f"goal {goal_id} not found"}
+    path = user_data[goal_id]["path"]
+    step = next((s for s in path["steps"] if s["id"] == step_id), None)
+    if not step:
+        return {"error": f"step {step_id} not found"}
+    step["status"] = "skipped"
+    step["inserted_by"] = "learner"  # mark sacred — engine won't unskip
+    step["skipped_reason"] = reason
+    step["skipped_at"] = datetime.utcnow().isoformat()
+    _recompute_progress(path)
+    path["recompute_history"].insert(0, {
+        "date": datetime.utcnow().isoformat()[:10],
+        "trigger": "learner_edit",
+        "reason": f"Learner skipped: {step.get('title')}" + (f" ({reason})" if reason else ""),
+        "added": [],
+        "modified_count": 1,
+    })
+    return {"goal_id": goal_id, "step_id": step_id, "status": "skipped"}
+
+
+def reorder_step(user_id: str, goal_id: str, step_id: str, new_order: float) -> dict:
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return {"error": f"goal {goal_id} not found"}
+    path = user_data[goal_id]["path"]
+    step = next((s for s in path["steps"] if s["id"] == step_id), None)
+    if not step:
+        return {"error": f"step {step_id} not found"}
+    step["order"] = float(new_order)
+    step["inserted_by"] = "learner"  # learner-touched → sacred
+    path["steps"].sort(key=lambda s: s.get("order", 999))
+    path["recompute_history"].insert(0, {
+        "date": datetime.utcnow().isoformat()[:10],
+        "trigger": "learner_edit",
+        "reason": f"Learner reordered: {step.get('title')} → position {new_order}",
+        "added": [],
+        "modified_count": 1,
+    })
+    return {"goal_id": goal_id, "step_id": step_id, "new_order": new_order}
 
 
 def insert_step_manual(user_id: str, goal_id: str, step: dict) -> dict:
