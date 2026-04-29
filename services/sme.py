@@ -24,7 +24,8 @@ questions on the same concept. Peraasan offers SME options inline. The
 matcher ranks candidates by (mastery × recency × opt-in × availability).
 """
 
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, timezone as tz
 
 
 # ──────────────────────────────────────────────────────────────
@@ -432,3 +433,210 @@ def _get_sme(sme_id: str):
         (s for s in REGISTERED_SMES + INTERNAL_SMES + EXTERNAL_SMES if s["sme_id"] == sme_id),
         None,
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# Slot picker — parse SME's free-form schedule_window and intersect
+# with the learner's calendar busy windows. Used by /sme/find_slots.
+# ──────────────────────────────────────────────────────────────
+
+DAY_TOKENS = {
+    "mon": 0, "monday": 0,
+    "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "wednesday": 2,
+    "thu": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+
+def parse_schedule_window(text: str) -> list:
+    """
+    Heuristic parser. Free-form text → list of {weekday, start_hour, end_hour}.
+
+    Handles:
+      "Tue/Thu 4-6pm"          → Tue+Thu 16:00-18:00
+      "Mon-Fri 9-5"            → Mon-Fri 09:00-17:00
+      "Weekdays 10am-12pm"     → Mon-Fri 10:00-12:00
+      "Wed PM, 30-min slots"   → Wed 12:00-17:00
+      "Mon/Wed evenings"       → Mon+Wed 17:00-21:00
+      "" / unparseable         → Mon-Fri 09:00-17:00 (default working week)
+    """
+    if not text or not text.strip():
+        return [{"weekday": d, "start_hour": 9, "end_hour": 17} for d in range(5)]
+
+    s = text.lower()
+    days = set()
+
+    # Day ranges
+    if re.search(r"(weekday|mon-fri|m-f|monday-friday)", s):
+        days.update(range(5))
+    if "weekend" in s:
+        days.update([5, 6])
+    # Day groupings (Tue/Thu, Mon, Wed, etc.)
+    for tok, d in DAY_TOKENS.items():
+        if re.search(rf"\b{tok}\b", s):
+            days.add(d)
+    if not days:
+        days.update(range(5))
+
+    # Time range
+    start_h, end_h = 9, 17
+    m = re.search(r"(\d{1,2})\s*(am|pm)?\s*[-–to]+\s*(\d{1,2})\s*(am|pm)?", s)
+    if m:
+        s1, sm, e1, em = m.groups()
+        s1, e1 = int(s1), int(e1)
+        sm = sm or em
+        em = em or sm
+        if sm == "pm" and s1 < 12: s1 += 12
+        if em == "pm" and e1 < 12: e1 += 12
+        if sm == "am" and s1 == 12: s1 = 0
+        if em == "am" and e1 == 12: e1 = 0
+        if 0 <= s1 < 24 and 0 <= e1 <= 24 and s1 < e1:
+            start_h, end_h = s1, e1
+    elif "morning" in s:
+        start_h, end_h = 7, 12
+    elif "afternoon" in s or re.search(r"\bpm\b", s):
+        start_h, end_h = 12, 17
+    elif "evening" in s:
+        start_h, end_h = 17, 21
+
+    return [{"weekday": d, "start_hour": start_h, "end_hour": end_h} for d in sorted(days)]
+
+
+def find_slots_for_sme(sme_id: str, learner_id: str, duration_min: int = 30, count: int = 3,
+                       window_days: int = 14) -> dict:
+    """
+    Intersect SME availability with learner's busy windows.
+    Returns top-N candidate slots in the same shape as scheduler.compute_free_slots.
+    """
+    sme = _get_sme(sme_id)
+    if not sme:
+        return {"error": f"sme {sme_id} not found", "slots": []}
+
+    # Lazy imports — avoid circular at module load (scheduler also lives in services/)
+    from . import calendar_client, scheduler
+
+    availability = parse_schedule_window(sme.get("schedule_window") or sme.get("availability_window") or "")
+    duration = max(15, int(duration_min or sme.get("preferred_session_length") or 30))
+
+    now = datetime.now(tz.utc)
+    window_end = now + timedelta(days=window_days)
+
+    # Learner's busy windows (real Calendar in live mode; deterministic stub otherwise)
+    learner_busy = calendar_client.list_busy_windows(learner_id, now, window_end)
+
+    by_weekday = {av["weekday"]: av for av in availability}
+    candidates = []
+    today = now.date()
+    day = today
+    while day <= window_end.date():
+        av = by_weekday.get(day.weekday())
+        if av:
+            day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz.utc).replace(hour=av["start_hour"])
+            day_end = datetime.combine(day, datetime.min.time(), tzinfo=tz.utc).replace(hour=av["end_hour"])
+            if day_end > now:
+                free = scheduler._subtract_busy(max(day_start, now), day_end, learner_busy)
+                for free_start, free_end in free:
+                    candidates.extend(scheduler._slice_slot(free_start, free_end, duration))
+        day += timedelta(days=1)
+
+    # Score: sooner is better; small midday bonus
+    def score(slot):
+        start = slot["start"]
+        score = 0.5
+        days_out = (start.date() - today).days
+        score += max(0, 0.4 - 0.05 * days_out)
+        if 10 <= start.hour <= 14:
+            score += 0.1
+        return round(min(1.0, score), 3)
+
+    ranked = sorted(
+        ({**c, "score": score(c)} for c in candidates),
+        key=lambda c: (-c["score"], c["start"]),
+    )
+    serialized = [scheduler._serialize_slot(c, today) for c in ranked[:count]]
+
+    return {
+        "sme_id": sme_id,
+        "sme_name": sme.get("name"),
+        "sme_role": sme.get("role"),
+        "topics": sme.get("topics") or [],
+        "duration_min": duration,
+        "schedule_window_text": sme.get("schedule_window") or sme.get("availability_window") or "",
+        "schedule_window_parsed": availability,
+        "slots": serialized,
+        "calendar_connected": calendar_client.is_connected(),
+        "expectations_from_students": sme.get("expectations_from_students", ""),
+        "rate_label": _rate_label(sme),
+    }
+
+
+def _rate_label(sme: dict) -> str:
+    rm = sme.get("rate_model")
+    if rm == "free":
+        return "Free"
+    if rm == "paid" or (sme.get("rate_per_30min") or 0) > 0:
+        return f"{(sme.get('rate_currency') or 'usd').upper()} {sme.get('rate_per_30min', 0)}/30 min"
+    return "Kudos only"
+
+
+def book_slot_with_sme(sme_id: str, learner_id: str, topic: str,
+                       start_at: str, end_at: str) -> dict:
+    """
+    Confirm a booked SME session. Creates dual Google Calendar events
+    (one on the learner's calendar, one on the SME's), persists a
+    booking row that mirrors Table 20 shape.
+
+    Both calendar.insert calls degrade to stub mode when no service
+    account is configured — same pattern as Project Manager Mode.
+    """
+    sme = _get_sme(sme_id)
+    if not sme:
+        return {"error": f"sme {sme_id} not found"}
+    if not start_at or not end_at:
+        return {"error": "start_at and end_at required (ISO 8601)"}
+
+    from . import calendar_client
+
+    start_dt = datetime.fromisoformat(start_at.replace("Z", "+00:00"))
+    end_dt = datetime.fromisoformat(end_at.replace("Z", "+00:00"))
+    title = f"📚 Aasan SME — {sme.get('name')} · {topic or (sme.get('topics') or ['session'])[0]}"
+    description = (
+        f"Topic: {topic}\n\n"
+        f"Read this before our session:\n"
+        f"{sme.get('expectations_from_students') or '(no specific prep instructions)'}\n\n"
+        f"SME bio: {sme.get('bio', '')}"
+    )
+
+    learner_event = calendar_client.insert_event(learner_id, title, start_dt, end_dt, description)
+
+    sme_calendar_id = (
+        sme.get("employee_id")
+        or sme.get("external_email")
+        or f"sme-{sme_id}"
+    )
+    sme_event = calendar_client.insert_event(sme_calendar_id, title, start_dt, end_dt, description)
+
+    booking = {
+        "booking_id": len(BOOKINGS) + 1,
+        "sme_id": sme_id,
+        "sme_name": sme.get("name"),
+        "learner_id": learner_id,
+        "topic": topic or (sme.get("topics") or ["session"])[0],
+        "scheduled_at": start_at,
+        "end_at": end_at,
+        "duration_minutes": int((end_dt - start_dt).total_seconds() // 60),
+        "rate_amount": sme.get("rate_per_30min", 0),
+        "rate_currency": sme.get("rate_currency"),
+        "status": "confirmed",
+        "calendar_event_id_learner": learner_event["event_id"],
+        "calendar_event_id_sme": sme_event["event_id"],
+        "calendar_event_url": learner_event["event_url"],
+        "meeting_url": f"https://meet.google.com/booking-{sme_id}-{int(start_dt.timestamp())}",
+        "mode": learner_event.get("mode", "live"),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    BOOKINGS.append(booking)
+    return booking

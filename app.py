@@ -1495,17 +1495,57 @@ def sme_find():
 
 @app.route("/sme/book", methods=["POST"])
 def sme_book():
-    """Book a session with an SME (mock confirmation in Phase 1)."""
+    """
+    Book a session with an SME.
+
+    Two modes:
+      A) Real slot booking — when start_at + end_at are provided, creates
+         dual Google Calendar events (learner + SME) and writes a booking
+         row matching Table 20.
+      B) Legacy stub — when only `slot` (free-text) is provided, returns
+         the V1 mock confirmation. Kept for backwards compat.
+    """
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     sme_id = data.get("sme_id")
     learner_id = data.get("learner_id", "demo-user")
     topic = data.get("topic", "")
-    slot = data.get("slot")
     if not sme_id:
         return jsonify({"error": "sme_id required"}), 400
+    start_at = data.get("start_at")
+    end_at = data.get("end_at")
+    if start_at and end_at:
+        return jsonify(sme.book_slot_with_sme(
+            sme_id=sme_id, learner_id=learner_id, topic=topic,
+            start_at=start_at, end_at=end_at,
+        ))
+    slot = data.get("slot")
     return jsonify(sme.book_sme(sme_id=sme_id, learner_id=learner_id, topic=topic, slot=slot))
+
+
+@app.route("/sme/find_slots", methods=["POST"])
+def sme_find_slots():
+    """
+    Intersect an SME's schedule_window with the learner's busy calendar
+    windows, return top-N candidate slots.
+
+    Body: { sme_id, learner_id, duration_min?, count?, window_days? }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    sme_id = data.get("sme_id")
+    learner_id = data.get("learner_id", "demo-user")
+    if not sme_id:
+        return jsonify({"error": "sme_id required"}), 400
+    return jsonify(sme.find_slots_for_sme(
+        sme_id=sme_id,
+        learner_id=learner_id,
+        duration_min=int(data.get("duration_min", 30)),
+        count=int(data.get("count", 3)),
+        window_days=int(data.get("window_days", 14)),
+    ))
 
 
 @app.route("/sme/bookings", methods=["POST"])
