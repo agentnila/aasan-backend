@@ -1550,12 +1550,29 @@ def sme_find_slots():
 
 @app.route("/sme/bookings", methods=["POST"])
 def sme_bookings():
-    """List a learner's bookings."""
+    """List a learner's bookings (legacy — single side). Use /sme/my_bookings for both sides."""
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     learner_id = data.get("learner_id", "demo-user")
     return jsonify(sme.list_bookings(learner_id=learner_id))
+
+
+@app.route("/sme/my_bookings", methods=["POST"])
+def sme_my_bookings():
+    """
+    Unified bookings inbox — both sides in one call.
+    Body: { user_id, include_past?: bool=false }
+    Returns: { as_learner: [...], as_sme: [...], counts, total }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    return jsonify(sme.list_my_bookings(
+        user_id=user_id,
+        include_past=bool(data.get("include_past", False)),
+    ))
 
 
 @app.route("/sme/register", methods=["POST"])

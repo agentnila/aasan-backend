@@ -423,6 +423,60 @@ def list_bookings(learner_id: str) -> dict:
     }
 
 
+def list_my_bookings(user_id: str, include_past: bool = False) -> dict:
+    """
+    Unified bookings view across both sides:
+      - as_learner: sessions this user booked with an SME
+      - as_sme:     sessions where this user IS the SME (someone booked them)
+
+    `as_sme` matches by linking BOOKINGS rows back to the SME's employee_id
+    (registered SMEs) — the field set when the SME self-registered.
+    """
+    if not user_id:
+        return {"error": "user_id required"}
+
+    # Build lookup: sme_id → employee_id (only registered SMEs have this link)
+    sme_to_employee = {s["sme_id"]: s.get("employee_id") for s in REGISTERED_SMES}
+
+    now_iso = datetime.utcnow().isoformat()
+
+    def is_active(b):
+        if b.get("status") in ("cancelled", "no_show"):
+            return False
+        if include_past:
+            return True
+        return (b.get("end_at") or b.get("scheduled_at") or "") > now_iso
+
+    def enrich(b, side):
+        s = _get_sme(b.get("sme_id")) or {}
+        return {
+            **b,
+            "side": side,
+            "sme_name": b.get("sme_name") or s.get("name"),
+            "sme_role": s.get("role", ""),
+            "sme_employee_id": s.get("employee_id"),
+            "expectations_from_students": s.get("expectations_from_students", ""),
+        }
+
+    as_learner = [enrich(b, "learner") for b in BOOKINGS if b.get("learner_id") == user_id and is_active(b)]
+    as_sme = [
+        enrich(b, "sme") for b in BOOKINGS
+        if sme_to_employee.get(b.get("sme_id")) == user_id and is_active(b)
+    ]
+
+    as_learner.sort(key=lambda b: b.get("scheduled_at", ""))
+    as_sme.sort(key=lambda b: b.get("scheduled_at", ""))
+
+    return {
+        "user_id": user_id,
+        "as_learner": as_learner,
+        "as_sme": as_sme,
+        "counts": {"as_learner": len(as_learner), "as_sme": len(as_sme)},
+        "total": len(as_learner) + len(as_sme),
+        "include_past": include_past,
+    }
+
+
 def register_internal_sme(employee_id: str, profile: dict) -> dict:
     """Backwards-compat wrapper. Forwards to register_sme()."""
     return register_sme(employee_id=employee_id, profile=profile)
