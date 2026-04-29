@@ -1520,7 +1520,15 @@ def sme_bookings():
 
 @app.route("/sme/register", methods=["POST"])
 def sme_register():
-    """Internal employee opts in as an SME."""
+    """
+    Self-registration as an SME. Body:
+      { employee_id, profile: { name (req), subjects (list, req),
+        subject_mastery, schedule_window, timezone, languages,
+        rate_model, rate_per_30min?, rate_currency?,
+        expectations_from_students, bio,
+        preferred_session_length, sme_type? } }
+    Idempotent on employee_id — re-registering updates the profile.
+    """
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
@@ -1528,7 +1536,31 @@ def sme_register():
     profile = data.get("profile", {}) or {}
     if not employee_id:
         return jsonify({"error": "employee_id required"}), 400
-    return jsonify(sme.register_internal_sme(employee_id=employee_id, profile=profile))
+    return jsonify(sme.register_sme(employee_id=employee_id, profile=profile))
+
+
+@app.route("/sme/profile", methods=["POST"])
+def sme_profile():
+    """Return an SME's own profile (for the edit form). Body: { employee_id }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    employee_id = data.get("employee_id")
+    if not employee_id:
+        return jsonify({"error": "employee_id required"}), 400
+    return jsonify(sme.get_sme_profile(employee_id=employee_id))
+
+
+@app.route("/sme/list", methods=["POST"])
+def sme_list():
+    """Browse the SME marketplace. Body: { active_only?: bool=true, limit?: int=100 }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(sme.list_smes(
+        active_only=bool(data.get("active_only", True)),
+        limit=int(data.get("limit", 100)),
+    ))
 
 
 # ─────────────────────────────────────────────

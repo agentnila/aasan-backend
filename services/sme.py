@@ -195,6 +195,140 @@ EXTERNAL_SMES = [
 BOOKINGS = []
 
 
+# ──────────────────────────────────────────────────────────────
+# Self-registered SMEs — opt-in flow (Phase 2: Airtable SME_Profiles)
+# Distinct from the demo seed INTERNAL_SMES/EXTERNAL_SMES so re-runs of
+# the seed don't clobber real registrations. find_smes() walks both.
+# ──────────────────────────────────────────────────────────────
+
+REGISTERED_SMES = []
+
+
+VALID_RATE_MODELS = {"free", "kudos_only", "paid"}
+VALID_SESSION_LENGTHS = {15, 30, 45, 60}
+
+
+def register_sme(employee_id: str, profile: dict) -> dict:
+    """
+    Self-registration for an SME (internal or external).
+
+    Required fields in `profile`:
+      - name (str)
+      - subjects (list[str], 1+ topic clusters)
+
+    Recommended fields:
+      - role / team
+      - subject_mastery (dict: {subject: 'beginner'|'intermediate'|'expert'|'can_teach'})
+      - schedule_window (str — free-form "Tue/Thu PM, 30-min slots")
+      - timezone (IANA, e.g. 'America/Los_Angeles' — auto-detected client-side)
+      - languages (list[str], default ['en'])
+      - rate_model ('free' | 'kudos_only' | 'paid')
+      - rate_per_30min (number, required if rate_model == 'paid')
+      - rate_currency (3-letter, required if rate_model == 'paid')
+      - expectations_from_students (str — what should students DO before booking?)
+      - bio (str)
+      - preferred_session_length (15 | 30 | 45 | 60)
+      - sme_type ('internal' | 'external', default 'internal')
+
+    Idempotent on employee_id: re-registering updates the profile, doesn't dupe.
+    """
+    if not employee_id:
+        return {"error": "employee_id required"}
+    name = (profile.get("name") or "").strip()
+    if not name:
+        return {"error": "profile.name required"}
+    subjects = [s.strip() for s in (profile.get("subjects") or []) if s and str(s).strip()]
+    if not subjects:
+        return {"error": "profile.subjects required (at least one)"}
+
+    rate_model = profile.get("rate_model", "kudos_only")
+    if rate_model not in VALID_RATE_MODELS:
+        return {"error": f"rate_model must be one of {sorted(VALID_RATE_MODELS)}"}
+    if rate_model == "paid":
+        if profile.get("rate_per_30min") in (None, 0, ""):
+            return {"error": "rate_per_30min required when rate_model='paid'"}
+        if not (profile.get("rate_currency") or "").strip():
+            return {"error": "rate_currency required when rate_model='paid'"}
+
+    session_len = int(profile.get("preferred_session_length", 30))
+    if session_len not in VALID_SESSION_LENGTHS:
+        return {"error": f"preferred_session_length must be one of {sorted(VALID_SESSION_LENGTHS)}"}
+
+    sme_type = profile.get("sme_type", "internal")
+
+    # Build topic_mastery dict for the find_smes ranking pipeline
+    declared = profile.get("subject_mastery") or {}
+    mastery_map = {"beginner": 0.4, "intermediate": 0.65, "expert": 0.85, "can_teach": 0.9}
+    topic_mastery = {
+        s: mastery_map.get(declared.get(s, "expert"), 0.85)
+        for s in subjects
+    }
+
+    now = datetime.utcnow().isoformat()
+    sme_id = f"reg-{employee_id}"
+    record = {
+        "sme_id": sme_id,
+        "sme_type": sme_type,
+        "employee_id": employee_id,
+        "name": name,
+        "role": profile.get("role", ""),
+        "team": profile.get("team", ""),
+        "topics": subjects,
+        "subject_mastery_declared": declared,
+        "topic_mastery": topic_mastery,
+        "schedule_window": profile.get("schedule_window", ""),
+        "availability_window": profile.get("schedule_window", ""),  # alias for legacy seed shape
+        "timezone": profile.get("timezone") or "UTC",
+        "languages": profile.get("languages") or ["en"],
+        "rate_model": rate_model,
+        "rate_per_30min": float(profile.get("rate_per_30min") or 0),
+        "rate_currency": (profile.get("rate_currency") or "").lower() or None,
+        "expectations_from_students": profile.get("expectations_from_students", ""),
+        "bio": profile.get("bio", ""),
+        "preferred_session_length": session_len,
+        "sessions_completed": 0,
+        "kudos_score": 5.0,
+        "opted_in": True,
+        "registered_at": now,
+        "updated_at": now,
+        "recent_activity_days_ago": 0,
+    }
+
+    # Idempotent upsert
+    for i, existing in enumerate(REGISTERED_SMES):
+        if existing.get("employee_id") == employee_id:
+            record["registered_at"] = existing.get("registered_at", now)
+            record["sessions_completed"] = existing.get("sessions_completed", 0)
+            record["kudos_score"] = existing.get("kudos_score", 5.0)
+            REGISTERED_SMES[i] = record
+            return {"ok": True, "created": False, "sme": record}
+    REGISTERED_SMES.append(record)
+    return {"ok": True, "created": True, "sme": record}
+
+
+def get_sme_profile(employee_id: str) -> dict:
+    """Return an SME's own profile (for the edit form)."""
+    if not employee_id:
+        return {"error": "employee_id required"}
+    sme = next((s for s in REGISTERED_SMES if s.get("employee_id") == employee_id), None)
+    if not sme:
+        return {"registered": False, "employee_id": employee_id}
+    return {"registered": True, "sme": sme}
+
+
+def list_smes(active_only: bool = True, limit: int = 100) -> dict:
+    """List all SMEs (registered + demo seed). Used by the SME Marketplace browse view."""
+    all_smes = list(REGISTERED_SMES) + list(INTERNAL_SMES) + list(EXTERNAL_SMES)
+    if active_only:
+        all_smes = [s for s in all_smes if s.get("opted_in")]
+    return {
+        "smes": all_smes[:limit],
+        "count": len(all_smes),
+        "registered_count": len(REGISTERED_SMES),
+        "demo_seed_count": len(INTERNAL_SMES) + len(EXTERNAL_SMES),
+    }
+
+
 def find_smes(topic: str, learner_id: str = None, limit: int = 5) -> dict:
     """
     Match SMEs against a topic. Returns ranked list with internal first
@@ -205,7 +339,7 @@ def find_smes(topic: str, learner_id: str = None, limit: int = 5) -> dict:
     topic_lower = topic.lower()
     candidates = []
 
-    for sme in INTERNAL_SMES + EXTERNAL_SMES:
+    for sme in REGISTERED_SMES + INTERNAL_SMES + EXTERNAL_SMES:
         # Match topic — substring or exact match
         match_mastery = 0.0
         for sme_topic, mastery in sme.get("topic_mastery", {}).items():
@@ -289,18 +423,12 @@ def list_bookings(learner_id: str) -> dict:
 
 
 def register_internal_sme(employee_id: str, profile: dict) -> dict:
-    """
-    Opt-in flow for an internal employee to register as an SME.
-    Phase 2: writes to Airtable SME_Profiles + flips opted_in=True.
-    """
-    return {
-        "sme_id": f"internal-{employee_id}",
-        "registered_at": datetime.utcnow().isoformat(),
-        "profile": profile,
-        "status": "opt_in_pending_approval",  # Phase 2: skip approval, flip immediately
-        "_note": "Phase 1: this is a stub. Phase 2 writes to Airtable + activates the SME.",
-    }
+    """Backwards-compat wrapper. Forwards to register_sme()."""
+    return register_sme(employee_id=employee_id, profile=profile)
 
 
 def _get_sme(sme_id: str):
-    return next((s for s in INTERNAL_SMES + EXTERNAL_SMES if s["sme_id"] == sme_id), None)
+    return next(
+        (s for s in REGISTERED_SMES + INTERNAL_SMES + EXTERNAL_SMES if s["sme_id"] == sme_id),
+        None,
+    )
