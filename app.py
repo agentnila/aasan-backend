@@ -610,6 +610,67 @@ def content_list():
     })
 
 
+@app.route("/content/coverage", methods=["POST"])
+def content_coverage():
+    """
+    Library module dashboard — aggregate stats over the indexed corpus.
+
+    Returns: {
+      total: int,
+      vector_total: int (Pinecone or stub cosine store),
+      by_source: { source_name: count, ... },
+      by_skill: { skill_cluster: count, ... },     # top 20 by count
+      by_difficulty: { beginner|intermediate|advanced: count },
+      by_content_type: { doc|video|tutorial|reference|exercise: count },
+      recent: [...last 5 indexed items, newest first]
+    }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    by_source, by_skill, by_difficulty, by_type = {}, {}, {}, {}
+    for item in content_index:
+        src = item.get("source") or "unknown"
+        by_source[src] = by_source.get(src, 0) + 1
+        for s in (item.get("skills") or []):
+            by_skill[s] = by_skill.get(s, 0) + 1
+        diff = item.get("difficulty") or "unknown"
+        by_difficulty[diff] = by_difficulty.get(diff, 0) + 1
+        ctype = item.get("content_type") or item.get("type") or "doc"
+        by_type[ctype] = by_type.get(ctype, 0) + 1
+
+    top_skills = dict(sorted(by_skill.items(), key=lambda kv: -kv[1])[:20])
+    recent = sorted(content_index, key=lambda c: c.get("indexed_at", ""), reverse=True)[:5]
+    recent_summary = [
+        {
+            "content_id": c.get("content_id"),
+            "title": c.get("title"),
+            "source": c.get("source"),
+            "source_url": c.get("source_url"),
+            "skills": c.get("skills") or [],
+            "difficulty": c.get("difficulty"),
+            "duration_minutes": c.get("duration_minutes"),
+            "indexed_at": c.get("indexed_at"),
+        }
+        for c in recent
+    ]
+
+    return jsonify({
+        "total": len(content_index),
+        "vector_total": vector_index.count(),
+        "by_source": by_source,
+        "by_skill": top_skills,
+        "by_difficulty": by_difficulty,
+        "by_content_type": by_type,
+        "recent": recent_summary,
+        "modes": {
+            "embeddings": "live" if embeddings.is_live() else "stub",
+            "vector_index": "live" if vector_index.is_live() else "stub",
+            "drive": "live" if drive_connector.is_connected() else "stub",
+        },
+    })
+
+
 # ─────────────────────────────────────────────
 # KNOWLEDGE CAPTURE ENDPOINTS
 # Called after a learning session to persist what was learned.
