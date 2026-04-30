@@ -296,6 +296,36 @@ def request_endorsements(user_id: str, entry_id: str, peer_emails: list, _entry_
     return {"ok": True, "endorsements": entry["endorsements"]}
 
 
+def decline_endorsement(author_user_id: str, entry_id: str, endorser_email: str, reason: str = "") -> dict:
+    """
+    Peer declines an endorsement request. Flips status to 'declined' and
+    emits a feed event for the author so they know not to wait.
+    """
+    entry = _find_entry(author_user_id, entry_id)
+    if not entry:
+        return {"error": f"entry {entry_id} not found"}
+
+    email = (endorser_email or "").strip().lower()
+    existing = next((e for e in entry["endorsements"] if e.get("endorser_email") == email), None)
+    if existing:
+        existing.update({
+            "status": "declined",
+            "endorsed_at": datetime.utcnow().isoformat(),
+            "comment": reason or existing.get("comment", ""),
+        })
+    else:
+        return {"error": "no pending endorsement request for this email"}
+
+    _emit_feed(_user_email_hint(author_user_id), {
+        "type": "endorsement_declined",
+        "from_user_email": email,
+        "entry_id": entry["entry_id"],
+        "entry_title": entry.get("title"),
+        "reason": reason,
+    })
+    return {"ok": True, "entry_id": entry_id, "endorsement": existing}
+
+
 def endorse_entry(author_user_id: str, entry_id: str, endorser_email: str,
                   endorser_name: str = "", endorser_role: str = "", comment: str = "") -> dict:
     """
@@ -567,6 +597,22 @@ def _stub_tailor(user_id, job_data, journal, matches):
                 "technologies": m["entry"].get("technologies", []),
                 "match_score": round(m["match_score"], 2),
                 "match_reason": _explain_match(m["entry"], job_data),
+                "company": m["entry"].get("company", ""),
+                "project": m["entry"].get("project", ""),
+                # Endorsements travel with the project — the recruiter (and the
+                # learner reviewing) sees who validated this work, with role
+                # and comment. Only `approved` show; pending endorsements
+                # would dilute the credibility signal.
+                "endorsements": [
+                    {
+                        "endorser_name": en.get("endorser_name") or en.get("endorser_email"),
+                        "endorser_role": en.get("endorser_role"),
+                        "comment": en.get("comment", ""),
+                        "endorsed_at": en.get("endorsed_at"),
+                    }
+                    for en in (m["entry"].get("endorsements") or [])
+                    if en.get("status") == "approved"
+                ],
             }
             for m in top_matches
         ],

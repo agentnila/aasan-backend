@@ -1789,6 +1789,20 @@ def resume_endorse():
     ))
 
 
+@app.route("/resume/decline_endorsement", methods=["POST"])
+def resume_decline_endorsement():
+    """Peer declines an endorsement request. Body: { author_user_id, entry_id, endorser_email, reason? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(resume.decline_endorsement(
+        author_user_id=data.get("author_user_id"),
+        entry_id=data.get("entry_id"),
+        endorser_email=data.get("endorser_email"),
+        reason=data.get("reason", ""),
+    ))
+
+
 @app.route("/resume/feed", methods=["POST"])
 def resume_feed():
     """Activity feed for a user (by email). Body: { user_email, limit?: int=25 }"""
