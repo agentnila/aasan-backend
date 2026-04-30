@@ -1723,16 +1723,79 @@ def resume_add():
     Capture a journal entry. Two modes:
       - Conversational: { user_id, raw_input } → Claude extracts structured fields
       - Direct: { user_id, structured: {...} } → caller-provided structure
+
+    Optional social fields (in `structured` or top-level):
+      company, project, peers_to_share_with: [emails], peers_to_endorse: [emails]
     """
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     user_id = data.get("user_id", "demo-user")
     raw = data.get("raw_input", "")
-    structured = data.get("structured")
-    if not raw and not structured:
+    structured = data.get("structured") or {}
+    # Hoist social fields onto structured if passed top-level
+    for k in ("company", "project", "peers_to_share_with", "peers_to_endorse"):
+        if data.get(k) is not None and structured.get(k) is None:
+            structured[k] = data[k]
+    if not raw and not (structured and (structured.get("title") or structured.get("description") or structured.get("company"))):
         return jsonify({"error": "raw_input or structured required"}), 400
     return jsonify(resume.add_entry(user_id=user_id, raw_input=raw, structured=structured))
+
+
+@app.route("/resume/share", methods=["POST"])
+def resume_share():
+    """Share an existing entry with peers. Body: { user_id, entry_id, peer_emails: [str] }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    entry_id = data.get("entry_id")
+    peer_emails = data.get("peer_emails") or []
+    if not entry_id:
+        return jsonify({"error": "entry_id required"}), 400
+    return jsonify(resume.share_entry(user_id=user_id, entry_id=entry_id, peer_emails=peer_emails))
+
+
+@app.route("/resume/request_endorsements", methods=["POST"])
+def resume_request_endorsements():
+    """Ask peers to endorse an entry. Body: { user_id, entry_id, peer_emails }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    entry_id = data.get("entry_id")
+    peer_emails = data.get("peer_emails") or []
+    if not entry_id:
+        return jsonify({"error": "entry_id required"}), 400
+    return jsonify(resume.request_endorsements(user_id=user_id, entry_id=entry_id, peer_emails=peer_emails))
+
+
+@app.route("/resume/endorse", methods=["POST"])
+def resume_endorse():
+    """
+    Peer endorses an entry. Body:
+      { author_user_id, entry_id, endorser_email, endorser_name?, endorser_role?, comment? }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(resume.endorse_entry(
+        author_user_id=data.get("author_user_id"),
+        entry_id=data.get("entry_id"),
+        endorser_email=data.get("endorser_email"),
+        endorser_name=data.get("endorser_name", ""),
+        endorser_role=data.get("endorser_role", ""),
+        comment=data.get("comment", ""),
+    ))
+
+
+@app.route("/resume/feed", methods=["POST"])
+def resume_feed():
+    """Activity feed for a user (by email). Body: { user_email, limit?: int=25 }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(resume.get_feed(user_email=data.get("user_email", ""), limit=int(data.get("limit", 25))))
 
 
 @app.route("/resume/journal", methods=["POST"])

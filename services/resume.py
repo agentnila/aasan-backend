@@ -158,6 +158,13 @@ def add_entry(user_id: str, raw_input: str = "", structured: dict = None) -> dic
     """
     journal = _ensure_user(user_id)
 
+    # Pull social/context fields out of structured before merging — these
+    # have a separate shape (lists of objects) we want to handle explicitly.
+    company = (structured or {}).get("company") if structured else None
+    project = (structured or {}).get("project") if structured else None
+    peers_share = (structured or {}).get("peers_to_share_with") or []
+    peers_endorse = (structured or {}).get("peers_to_endorse") or []
+
     if structured:
         entry = {
             "entry_id": f"j-{int(datetime.utcnow().timestamp())}",
@@ -177,12 +184,184 @@ def add_entry(user_id: str, raw_input: str = "", structured: dict = None) -> dic
             **extracted,
         }
 
+    # Always-present social fields
+    entry["company"] = (company or "").strip()
+    entry["project"] = (project or "").strip()
+    entry["author_id"] = user_id
+    entry["endorsements"] = []
+    entry["shared_with"] = []
+
+    # Apply share + endorsement requests, generating feed events as side effects
+    if peers_share:
+        share_entry(user_id, entry["entry_id"], peers_share, _entry_ref=entry, _suppress_journal_lookup=True)
+    if peers_endorse:
+        request_endorsements(user_id, entry["entry_id"], peers_endorse, _entry_ref=entry, _suppress_journal_lookup=True)
+
     journal.append(entry)
     return {
         "entry": entry,
         "journal_size": len(journal),
         "modes": {"classifier": "live" if claude_client.is_live() else "stub"},
     }
+
+
+# ──────────────────────────────────────────────────────────────
+# Social layer — endorsements, share, peer feed
+# Phase 1: in-memory ENDORSEMENTS + FEED. Phase 2: Airtable Tables 26b/26c.
+#
+# Identity model: peers identified by email. When the peer signs in to
+# Aasan with the same email, their feed includes any pending requests.
+# Until then, requests sit dormant (and can be expedited via email — Phase D).
+# ──────────────────────────────────────────────────────────────
+
+# { peer_email: [feed_event, ...] }   — newest at end
+_FEED = {}
+
+
+def _emit_feed(peer_email: str, event: dict) -> None:
+    if not peer_email:
+        return
+    key = peer_email.lower().strip()
+    if not key:
+        return
+    _FEED.setdefault(key, []).append({**event, "feed_id": f"f-{int(datetime.utcnow().timestamp() * 1000)}-{len(_FEED.get(key, []))}", "created_at": datetime.utcnow().isoformat()})
+
+
+def _find_entry(user_id: str, entry_id: str):
+    journal = _ensure_user(user_id)
+    return next((e for e in journal if e.get("entry_id") == entry_id), None)
+
+
+def share_entry(user_id: str, entry_id: str, peer_emails: list, _entry_ref=None, _suppress_journal_lookup=False) -> dict:
+    """
+    Share an existing journal entry with one or more peer emails.
+    Each peer gets a `shared_entry` event in their feed.
+    """
+    entry = _entry_ref if _suppress_journal_lookup else _find_entry(user_id, entry_id)
+    if not entry:
+        return {"error": f"entry {entry_id} not found"}
+
+    cleaned = [e.strip().lower() for e in (peer_emails or []) if e and e.strip()]
+    for email in cleaned:
+        if email in entry["shared_with"]:
+            continue
+        entry["shared_with"].append(email)
+        _emit_feed(email, {
+            "type": "shared_entry",
+            "from_user_id": user_id,
+            "entry_id": entry["entry_id"],
+            "entry_title": entry.get("title"),
+            "entry_date": entry.get("date"),
+            "entry_company": entry.get("company"),
+            "entry_project": entry.get("project"),
+            "entry_outcomes": (entry.get("outcomes") or [])[:2],
+        })
+    return {"ok": True, "shared_with": entry["shared_with"], "count": len(entry["shared_with"])}
+
+
+def request_endorsements(user_id: str, entry_id: str, peer_emails: list, _entry_ref=None, _suppress_journal_lookup=False) -> dict:
+    """
+    Ask peers to endorse the entry. Each peer gets an `endorsement_requested`
+    event. The entry tracks pending endorsements; when the peer endorses,
+    status flips to approved.
+    """
+    entry = _entry_ref if _suppress_journal_lookup else _find_entry(user_id, entry_id)
+    if not entry:
+        return {"error": f"entry {entry_id} not found"}
+
+    cleaned = [e.strip().lower() for e in (peer_emails or []) if e and e.strip()]
+    for email in cleaned:
+        existing = next((en for en in entry["endorsements"] if en.get("endorser_email") == email), None)
+        if existing:
+            continue
+        entry["endorsements"].append({
+            "endorser_email": email,
+            "endorser_name": None,
+            "endorser_role": None,
+            "status": "pending",
+            "requested_at": datetime.utcnow().isoformat(),
+            "endorsed_at": None,
+            "comment": "",
+        })
+        _emit_feed(email, {
+            "type": "endorsement_requested",
+            "from_user_id": user_id,
+            "entry_id": entry["entry_id"],
+            "entry_title": entry.get("title"),
+            "entry_date": entry.get("date"),
+            "entry_company": entry.get("company"),
+            "entry_project": entry.get("project"),
+            "entry_outcomes": (entry.get("outcomes") or [])[:2],
+        })
+    return {"ok": True, "endorsements": entry["endorsements"]}
+
+
+def endorse_entry(author_user_id: str, entry_id: str, endorser_email: str,
+                  endorser_name: str = "", endorser_role: str = "", comment: str = "") -> dict:
+    """
+    Peer adds their endorsement to an entry (typically via the feed CTA).
+    Flips the matching endorsement record to status='approved' and emits a
+    `endorsement_received` feed event for the author.
+    """
+    entry = _find_entry(author_user_id, entry_id)
+    if not entry:
+        return {"error": f"entry {entry_id} not found"}
+
+    email = (endorser_email or "").strip().lower()
+    if not email:
+        return {"error": "endorser_email required"}
+
+    existing = next((e for e in entry["endorsements"] if e.get("endorser_email") == email), None)
+    if existing:
+        existing.update({
+            "endorser_name": endorser_name or existing.get("endorser_name") or email,
+            "endorser_role": endorser_role or existing.get("endorser_role") or "",
+            "status": "approved",
+            "endorsed_at": datetime.utcnow().isoformat(),
+            "comment": comment or existing.get("comment", ""),
+        })
+    else:
+        entry["endorsements"].append({
+            "endorser_email": email,
+            "endorser_name": endorser_name or email,
+            "endorser_role": endorser_role,
+            "status": "approved",
+            "requested_at": None,
+            "endorsed_at": datetime.utcnow().isoformat(),
+            "comment": comment,
+        })
+
+    # Author's feed gets the receipt
+    _emit_feed(_user_email_hint(author_user_id), {
+        "type": "endorsement_received",
+        "from_user_email": email,
+        "from_user_name": endorser_name or email,
+        "from_user_role": endorser_role,
+        "entry_id": entry["entry_id"],
+        "entry_title": entry.get("title"),
+        "comment": comment,
+    })
+    return {"ok": True, "entry_id": entry_id, "endorsement": existing or entry["endorsements"][-1]}
+
+
+def get_feed(user_email: str, limit: int = 25) -> dict:
+    """
+    Return the activity feed for a user. Looks up by email.
+    Newest first. Includes pending endorsement requests as actionable items.
+    """
+    if not user_email:
+        return {"events": [], "count": 0}
+    events = list(reversed(_FEED.get(user_email.lower().strip(), [])))[:limit]
+    return {
+        "user_email": user_email,
+        "events": events,
+        "count": len(events),
+    }
+
+
+def _user_email_hint(user_id: str) -> str:
+    """Best-effort: most user_id values in V3 ARE Workspace emails."""
+    return user_id if "@" in (user_id or "") else ""
 
 
 def list_journal(user_id: str, limit: int = 50) -> dict:
