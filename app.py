@@ -29,7 +29,8 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log
+from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -1392,6 +1393,11 @@ def path_recompute():
 
 
 @app.route("/goal/create", methods=["POST"])
+@audit_action(
+    "goal:create",
+    target_fn=target_goal,
+    details_fn=lambda req, _resp: {"priority": ((req.get_json(silent=True) or {}).get("goal") or {}).get("priority")},
+)
 def goal_create():
     """
     Create a new goal + empty path. Body: { user_id, goal: {name, priority?,
@@ -1408,6 +1414,7 @@ def goal_create():
 
 
 @app.route("/goal/archive", methods=["POST"])
+@audit_action("goal:archive", target_fn=target_goal)
 def goal_archive():
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
@@ -1451,6 +1458,7 @@ def path_reorder():
 
 
 @app.route("/path/skip_step", methods=["POST"])
+@audit_action("path:skip_step", target_fn=target_path_step)
 def path_skip_step():
     """Manual learner edit — skip a step. Engine never unskips."""
     if not verify_secret(request):
@@ -1465,6 +1473,11 @@ def path_skip_step():
 
 
 @app.route("/path/mark_done", methods=["POST"])
+@audit_action(
+    "path:mark_done",
+    target_fn=target_path_step,
+    details_fn=lambda req, _resp: {"mastery": (req.get_json(silent=True) or {}).get("mastery")},
+)
 def path_mark_done():
     """Mark a step done with optional mastery + duration. Used by capture flow + manual."""
     if not verify_secret(request):
@@ -1555,6 +1568,10 @@ def sme_find():
 
 
 @app.route("/sme/book", methods=["POST"])
+@audit_action(
+    "sme:book",
+    target_fn=lambda req, _resp: f"sme:{(req.get_json(silent=True) or {}).get('sme_id', '?')}",
+)
 def sme_book():
     """
     Book a session with an SME.
@@ -1743,6 +1760,11 @@ def resume_add():
 
 
 @app.route("/resume/share", methods=["POST"])
+@audit_action(
+    "resume:share",
+    target_fn=target_resume_entry,
+    details_fn=lambda req, _resp: {"recipients": len((req.get_json(silent=True) or {}).get("peer_emails") or [])},
+)
 def resume_share():
     """Share an existing entry with peers. Body: { user_id, entry_id, peer_emails: [str] }"""
     if not verify_secret(request):
@@ -1771,6 +1793,7 @@ def resume_request_endorsements():
 
 
 @app.route("/resume/endorse", methods=["POST"])
+@audit_action("resume:endorse", target_fn=target_resume_entry)
 def resume_endorse():
     """
     Peer endorses an entry. Body:
@@ -2343,6 +2366,11 @@ def admin_users_list():
 
 
 @app.route("/admin/users/set_role", methods=["POST"])
+@audit_action(
+    "admin:role_change",
+    target_fn=target_user,
+    details_fn=lambda req, _resp: {"new_role": (req.get_json(silent=True) or {}).get("role")},
+)
 def admin_users_set_role():
     """Body: { target_user_id, role }"""
     if not verify_secret(request):
@@ -2359,6 +2387,11 @@ def admin_users_set_role():
 
 
 @app.route("/admin/users/import_csv", methods=["POST"])
+@audit_action(
+    "admin:user_bulk_import",
+    target_fn=lambda _req, _resp: "users:csv_import",
+    details_fn=lambda req, _resp: {"csv_lines": len((req.get_json(silent=True) or {}).get("csv", "").splitlines())},
+)
 def admin_users_import_csv():
     """Bulk import users from CSV. Body: { csv: str } — pasted CSV content."""
     if not verify_secret(request):
@@ -2369,6 +2402,50 @@ def admin_users_import_csv():
     data = request.json or {}
     csv_text = data.get("csv", "")
     return jsonify(rbac.import_users_csv(actor, csv_text))
+
+
+@app.route("/admin/audit_log", methods=["POST"])
+def admin_audit_log():
+    """
+    Search the audit log. org_admin only. Body filters all optional:
+      filter_actor, filter_action (supports trailing-* glob), filter_target,
+      since (ISO), until (ISO), search (full-text), limit (default 200).
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:audit_log"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    return jsonify(audit_log.query(
+        filter_actor=data.get("filter_actor"),
+        filter_action=data.get("filter_action"),
+        filter_target=data.get("filter_target"),
+        since=data.get("since"),
+        until=data.get("until"),
+        search=data.get("search"),
+        limit=int(data.get("limit", 200)),
+    ))
+
+
+@app.route("/admin/audit_log/export_csv", methods=["POST"])
+def admin_audit_log_export_csv():
+    """Return CSV of (filtered) audit entries. org_admin only."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:audit_log"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    csv_text = audit_log.export_csv(filters={
+        "filter_actor":  data.get("filter_actor"),
+        "filter_action": data.get("filter_action"),
+        "filter_target": data.get("filter_target"),
+        "since":         data.get("since"),
+        "until":         data.get("until"),
+        "search":        data.get("search"),
+    })
+    return jsonify({"csv": csv_text, "filename": f"aasan-audit-log-{datetime.utcnow().date().isoformat()}.csv"})
 
 
 @app.route("/admin/users/csv_sample", methods=["GET", "POST"])
@@ -2384,6 +2461,11 @@ def admin_users_csv_sample():
 
 
 @app.route("/admin/users/update", methods=["POST"])
+@audit_action(
+    "admin:user_update",
+    target_fn=target_user,
+    details_fn=lambda req, _resp: {"fields": list(((req.get_json(silent=True) or {}).get("fields") or {}).keys())},
+)
 def admin_users_update():
     """Body: { target_user_id, fields: {name?, email?, department?, manager_user_id?, is_active?} }"""
     if not verify_secret(request):
@@ -2439,6 +2521,10 @@ def team_member():
 
 
 @app.route("/team/kudos", methods=["POST"])
+@audit_action(
+    "team:kudos",
+    target_fn=lambda req, _resp: f"user:{(req.get_json(silent=True) or {}).get('report_id', '?')}",
+)
 def team_kudos():
     """Manager sends kudos to a report. Body: { manager_id, report_id, message? }"""
     if not verify_secret(request):

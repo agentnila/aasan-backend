@@ -241,6 +241,8 @@ def share_entry(user_id: str, entry_id: str, peer_emails: list, _entry_ref=None,
     if not entry:
         return {"error": f"entry {entry_id} not found"}
 
+    entry.setdefault("shared_with", [])
+    entry.setdefault("endorsements", [])
     cleaned = [e.strip().lower() for e in (peer_emails or []) if e and e.strip()]
     for email in cleaned:
         if email in entry["shared_with"]:
