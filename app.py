@@ -2358,6 +2358,31 @@ def admin_users_set_role():
     return jsonify(rbac.set_role(actor, target, new_role))
 
 
+@app.route("/admin/users/import_csv", methods=["POST"])
+def admin_users_import_csv():
+    """Bulk import users from CSV. Body: { csv: str } — pasted CSV content."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    csv_text = data.get("csv", "")
+    return jsonify(rbac.import_users_csv(actor, csv_text))
+
+
+@app.route("/admin/users/csv_sample", methods=["GET", "POST"])
+def admin_users_csv_sample():
+    """Return a sample CSV body the admin can use as a template."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify({
+        "csv": rbac.CSV_SAMPLE,
+        "header_columns": ["email (required)", "name", "role", "department", "manager_email", "is_active"],
+        "valid_roles": sorted(rbac.VALID_ROLES),
+    })
+
+
 @app.route("/admin/users/update", methods=["POST"])
 def admin_users_update():
     """Body: { target_user_id, fields: {name?, email?, department?, manager_user_id?, is_active?} }"""

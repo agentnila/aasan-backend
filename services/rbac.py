@@ -213,6 +213,165 @@ def set_role(actor_user_id: str, target_user_id: str, new_role: str) -> dict:
     return {"ok": True, "user": target}
 
 
+CSV_SAMPLE = (
+    "email,name,role,department,manager_email,is_active\n"
+    "priya.singh@example.com,Priya Singh,manager,Platform Engineering,balaji@example.com,true\n"
+    "david.kim@example.com,David Kim,learner,Platform Engineering,priya.singh@example.com,true\n"
+    "raj.kumar@example.com,Raj Kumar,ld_admin,People & Learning,balaji@example.com,true\n"
+)
+
+
+def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
+    """
+    Bulk user import from a CSV blob. Idempotent on email — existing rows
+    update; new rows create.
+
+    CSV header (case-insensitive): email (REQUIRED) · name · role ·
+    department · manager_email · is_active.
+
+    Validations:
+      - email is required and must contain '@'
+      - role (if present) must be a valid role; otherwise the row is skipped
+        WITH role assignment (the rest of the row still applies) and an
+        error is returned for visibility
+      - manager_email need not yet exist in the system — references resolve
+        on a second pass within the same import OR can be filled in by a
+        later import
+
+    Returns:
+      { ok, created: int, updated: int, skipped: int, errors: [...],
+        rows_processed: int }
+    """
+    if not has_any_permission(actor_user_id, "admin:users"):
+        return {"error": "forbidden — admin:users required"}
+
+    import csv as _csv
+    import io
+
+    text = (csv_text or "").strip()
+    if not text:
+        return {"error": "empty CSV body"}
+
+    reader = _csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        return {"error": "CSV has no header row"}
+
+    # Normalize headers (lowercase + strip)
+    reader.fieldnames = [h.strip().lower() for h in reader.fieldnames]
+    if "email" not in reader.fieldnames:
+        return {"error": "CSV must have an `email` column"}
+
+    created = 0
+    updated = 0
+    skipped = 0
+    errors = []
+    rows_processed = 0
+    seen_emails = set()
+    pending_manager_email = []  # rows whose manager_email refers to an email NOT yet in the system; we'll re-resolve at the end
+
+    # First pass — build email → user_id index of existing + this-import users
+    email_to_id = {}
+    for u in _USERS.values():
+        if u.get("email"):
+            email_to_id[u["email"].lower()] = u["user_id"]
+
+    for row_index, row in enumerate(reader, start=2):  # start at 2 (header row is 1)
+        rows_processed += 1
+        email = (row.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            errors.append({"row": row_index, "error": "missing or invalid email"})
+            skipped += 1
+            continue
+        if email in seen_emails:
+            errors.append({"row": row_index, "error": f"duplicate email in CSV: {email}"})
+            skipped += 1
+            continue
+        seen_emails.add(email)
+
+        name = (row.get("name") or "").strip()
+        if not name:
+            # Derive a default name from the email local-part
+            name = email.split("@")[0].replace(".", " ").replace("-", " ").replace("_", " ").title()
+
+        role = (row.get("role") or "").strip().lower()
+        role_error = None
+        if role and role not in VALID_ROLES:
+            role_error = f"invalid role '{role}' (allowed: {', '.join(sorted(VALID_ROLES))})"
+            errors.append({"row": row_index, "email": email, "error": role_error})
+            role = ""  # leave role unset; row still applied
+        if not role:
+            role = "learner"  # default
+
+        department = (row.get("department") or "").strip()
+        manager_email_raw = (row.get("manager_email") or "").strip().lower()
+        is_active_raw = (row.get("is_active") or "").strip().lower()
+        is_active = (is_active_raw not in ("false", "0", "no", "n", "off"))
+
+        # Resolve manager_email → user_id if possible
+        manager_user_id = email_to_id.get(manager_email_raw) if manager_email_raw else None
+        if manager_email_raw and not manager_user_id:
+            pending_manager_email.append((email, manager_email_raw))
+
+        existing_id = email_to_id.get(email)
+        now = datetime.utcnow().isoformat()
+        if existing_id:
+            target = _USERS[existing_id]
+            target["name"] = name
+            target["role"] = role
+            target["department"] = department
+            if manager_user_id is not None:
+                target["manager_user_id"] = manager_user_id
+            target["is_active"] = is_active
+            target["updated_at"] = now
+            updated += 1
+        else:
+            # Create. user_id slug from email local-part for legibility.
+            user_id = email.split("@")[0]
+            base_id = user_id
+            n = 1
+            while user_id in _USERS:
+                n += 1
+                user_id = f"{base_id}-{n}"
+            _USERS[user_id] = {
+                "user_id": user_id,
+                "email": email,
+                "name": name,
+                "role": role,
+                "department": department,
+                "manager_user_id": manager_user_id,
+                "is_active": is_active,
+                "created_at": now,
+                "last_active_at": now,
+                "scim_external_id": None,
+            }
+            email_to_id[email] = user_id
+            created += 1
+
+    # Second pass — resolve pending manager_email references that pointed
+    # at users created earlier in THIS same CSV.
+    resolved_managers = 0
+    for child_email, mgr_email in pending_manager_email:
+        mgr_id = email_to_id.get(mgr_email)
+        if not mgr_id:
+            errors.append({"email": child_email, "error": f"manager_email '{mgr_email}' not found"})
+            continue
+        child_id = email_to_id.get(child_email)
+        if child_id and _USERS.get(child_id):
+            _USERS[child_id]["manager_user_id"] = mgr_id
+            resolved_managers += 1
+
+    return {
+        "ok": True,
+        "rows_processed": rows_processed,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "manager_links_resolved_in_second_pass": resolved_managers,
+        "errors": errors,
+        "total_users_after": len(_USERS),
+    }
+
+
 def update_user(actor_user_id: str, target_user_id: str, fields: dict) -> dict:
     if not has_any_permission(actor_user_id, "admin:users"):
         return {"error": "forbidden — only org_admin can update users"}
