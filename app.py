@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2456,6 +2456,24 @@ def admin_reports_export_csv():
         "csv": csv_text,
         "filename": f"aasan-report-{report_id}-{datetime.utcnow().date().isoformat()}.csv",
     })
+
+
+@app.route("/admin/skill_heatmap", methods=["POST"])
+@audit_action("report:skill_heatmap", target_fn=lambda req, _resp: "report:skill_heatmap")
+def admin_skill_heatmap():
+    """
+    Org-level skill heatmap. Body: { departments_filter?: [str] }
+    Returns matrix[dept][skill] + supply (content + SMEs) + demand-supply gaps.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "report:run"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    return jsonify(skill_heatmap.build_heatmap(
+        departments_filter=data.get("departments_filter") or None,
+    ))
 
 
 @app.route("/admin/audit_log", methods=["POST"])
