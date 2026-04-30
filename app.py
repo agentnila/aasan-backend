@@ -2407,12 +2407,22 @@ def admin_users_update():
 
 @app.route("/team/list", methods=["POST"])
 def team_list():
-    """Manager's direct reports + summary stats. Body: { manager_id }"""
+    """Manager's direct reports + summary stats. Body: { manager_id, include_skip?: bool=false }"""
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     manager_id = data.get("manager_id", "demo-user")
-    return jsonify(team.list_team(manager_id=manager_id))
+    include_skip = bool(data.get("include_skip", False))
+    return jsonify(team.list_team(manager_id=manager_id, include_skip=include_skip))
+
+
+@app.route("/team/org_chart", methods=["POST"])
+def team_org_chart():
+    """Manager → reports tree. Body: { root_user_id?: str }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(team.get_org_chart(root_user_id=data.get("root_user_id")))
 
 
 @app.route("/team/member", methods=["POST"])

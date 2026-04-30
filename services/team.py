@@ -1,22 +1,26 @@
 """
 Team module — manager-facing view of team learning progress.
 
-Phase 1 storage: hardcoded demo team for the `demo-user` manager. Every
-other user_id returns an empty team (until real org structure ships in
-Phase D — likely via Workspace Directory API or HRIS sync).
+Phase B (Internal Pilot Pack): list_team queries the org graph in
+services/rbac (manager_user_id field) instead of a hardcoded demo team.
+The 5 demo personas (priya / david / alex / maya / jordan) keep their
+rich profile data via _DEMO_PROFILE_CACHE so the demo stays impressive;
+any newly-imported team member gets a sensible default profile.
 
-Each team member is a "report" persona with a primary goal, path summary,
-recent sessions, gaps, and a status (on_track / behind / blocked /
-exploring / mandatory). Manager sees these as cards on the Team canvas.
+Each team member is a "report" with a primary goal, path summary, recent
+sessions, gaps, and a status (on_track / behind / blocked / exploring /
+mandatory). Manager sees these as cards on the Team canvas.
 """
 
 from datetime import datetime, timedelta
+from . import rbac
 
 
 # ──────────────────────────────────────────────────────────────
-# Demo team — hardcoded reports for the demo-user manager.
-# Each report has the same shape: a "summary" view used on the
-# Team canvas grid + a "detail" view used on click-to-expand.
+# Demo profile cache — rich learning state for the 5 demo personas.
+# Keyed by user_id. Phase B looks up by user_id whenever a report is
+# in this dict; otherwise generates a default profile from rbac record.
+# Real production: this data comes from path_engine + resume + sessions.
 # ──────────────────────────────────────────────────────────────
 
 def _demo_team():
@@ -175,27 +179,74 @@ def _demo_team():
 _KUDOS_LOG = []
 
 
-def list_team(manager_id: str) -> dict:
-    """
-    List the manager's direct reports with summary fields for the Team canvas grid.
-    Demo team is populated for `demo-user`; everyone else gets empty.
-    """
-    if manager_id != "demo-user":
-        return {
-            "manager_id": manager_id,
-            "team": [],
-            "count": 0,
-            "summary": {
-                "on_track": 0, "behind": 0, "blocked": 0,
-                "exploring": 0, "mandatory": 0,
-                "needs_attention": 0,
-                "avg_readiness": 0,
-                "total_sessions_30d": 0,
-                "total_minutes_30d": 0,
-            },
-        }
+# Index demo profiles by user_id once at module load — these are the rich
+# learning-state caches for the 5 demo personas. Newly-imported team
+# members not in this dict get a default profile via _default_profile().
+_DEMO_PROFILE_CACHE = {p["user_id"]: p for p in _demo_team()}
 
-    team = _demo_team()
+
+def _default_profile(user_record: dict) -> dict:
+    """Sensible default for any report not in the demo profile cache."""
+    return {
+        "user_id": user_record["user_id"],
+        "name": user_record.get("name") or user_record["user_id"],
+        "email": user_record.get("email"),
+        "role": user_record.get("role", "Member"),
+        "team": user_record.get("department", ""),
+        "primary_goal": {
+            "name": "—",
+            "priority": "exploration",
+            "timeline": "Not set",
+            "days_left": None,
+            "readiness": 0,
+            "readiness_delta": "no goal yet",
+        },
+        "status": "exploring",
+        "status_label": "Just joined",
+        "last_active": user_record.get("last_active_at"),
+        "sessions_30d": 0,
+        "minutes_30d": 0,
+        "completed_steps_30d": 0,
+        "gaps_count": 0,
+        "current_step": "Not started",
+        "recent_sessions": [],
+        "gaps": [],
+        "kudos_count": 0,
+    }
+
+
+def _build_report_card(user_record: dict) -> dict:
+    """Merge rbac user record with demo profile cache (or default)."""
+    cached = _DEMO_PROFILE_CACHE.get(user_record["user_id"])
+    if cached:
+        # Refresh top-level identity fields from rbac (in case admin updated them)
+        return {
+            **cached,
+            "name": user_record.get("name") or cached["name"],
+            "email": user_record.get("email") or cached.get("email"),
+            "role": user_record.get("role", cached.get("role")),
+            "team": user_record.get("department") or cached.get("team", ""),
+        }
+    return _default_profile(user_record)
+
+
+def list_team(manager_id: str, include_skip: bool = False) -> dict:
+    """
+    List the manager's direct reports — pulled from the org graph in rbac
+    (manager_user_id field). Rich profiles come from the demo cache for
+    the 5 canned personas; default profiles for anyone else.
+
+    When include_skip=True, also includes skip-level reports (reports of
+    your reports) — used by skip_manager role.
+    """
+    direct_records = rbac.get_reports(manager_id)
+    skip_records = rbac.get_skip_reports(manager_id) if include_skip else []
+
+    # Build report cards
+    direct = [_build_report_card(r) for r in direct_records]
+    skip = [{**_build_report_card(r), "is_skip": True, "via_manager_id": r.get("manager_user_id")} for r in skip_records]
+
+    team = direct + skip
 
     summary = {
         "on_track":   sum(1 for m in team if m["status"] == "on_track"),
@@ -204,16 +255,21 @@ def list_team(manager_id: str) -> dict:
         "exploring":  sum(1 for m in team if m["status"] == "exploring"),
         "mandatory":  sum(1 for m in team if m["status"] == "mandatory"),
         "needs_attention": sum(1 for m in team if m.get("manager_attention_flag")),
-        "avg_readiness": round(sum(m["primary_goal"]["readiness"] for m in team) / max(len(team), 1)),
+        "avg_readiness": round(sum(m["primary_goal"]["readiness"] for m in team) / max(len(team), 1)) if team else 0,
         "total_sessions_30d": sum(m["sessions_30d"] for m in team),
         "total_minutes_30d":  sum(m["minutes_30d"] for m in team),
+        "direct_count": len(direct),
+        "skip_count":   len(skip),
     }
 
     # Aggregate goal coverage — what is the team learning?
     goals_by_priority = {}
+    departments = {}
     for m in team:
         p = m["primary_goal"]["priority"]
         goals_by_priority[p] = goals_by_priority.get(p, 0) + 1
+        d = m.get("team") or "Unassigned"
+        departments[d] = departments.get(d, 0) + 1
 
     return {
         "manager_id": manager_id,
@@ -221,12 +277,19 @@ def list_team(manager_id: str) -> dict:
         "count": len(team),
         "summary": summary,
         "goals_by_priority": goals_by_priority,
+        "departments": departments,
+        "include_skip": include_skip,
     }
+
+
+def get_org_chart(root_user_id: str = None) -> dict:
+    """Manager → reports tree starting from a root user (or every top-level user)."""
+    return rbac.get_org_tree(root_user_id=root_user_id)
 
 
 def get_team_member(manager_id: str, member_id: str) -> dict:
     """Detailed view of one report — same data as list_team's row, surfaced standalone."""
-    team = list_team(manager_id).get("team", [])
+    team = list_team(manager_id, include_skip=True).get("team", [])
     member = next((m for m in team if m["user_id"] == member_id), None)
     if not member:
         return {"error": f"team member {member_id} not found"}
@@ -241,7 +304,7 @@ def send_kudos(manager_id: str, report_id: str, message: str = "") -> dict:
     """
     if not report_id:
         return {"error": "report_id required"}
-    team = list_team(manager_id).get("team", [])
+    team = list_team(manager_id, include_skip=True).get("team", [])
     member = next((m for m in team if m["user_id"] == report_id), None)
     if not member:
         return {"error": f"report {report_id} not in team"}

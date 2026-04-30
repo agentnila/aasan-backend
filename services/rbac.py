@@ -173,6 +173,65 @@ def me(user_id: str) -> dict:
     }
 
 
+def get_reports(manager_user_id: str) -> list:
+    """Direct reports of a manager — users whose manager_user_id matches."""
+    if not manager_user_id:
+        return []
+    _ensure_user("demo-user")  # trigger seed so org graph has nodes for the demo
+    return [u for u in _USERS.values() if u.get("manager_user_id") == manager_user_id and u.get("is_active", True)]
+
+
+def get_skip_reports(manager_user_id: str) -> list:
+    """
+    Skip-level reports — reports of *your reports*. Used by `skip_manager`
+    role and as a context-pane affordance for any manager who wants
+    visibility one level down.
+    """
+    direct = get_reports(manager_user_id)
+    skip = []
+    for d in direct:
+        skip.extend(get_reports(d["user_id"]))
+    return skip
+
+
+def get_org_tree(root_user_id: str = None, max_depth: int = 4) -> dict:
+    """
+    Build a manager → reports tree starting from root (default: any user
+    with no manager_user_id, capped at max_depth to avoid runaway recursion
+    on cycles).
+    """
+    _ensure_user("demo-user")  # trigger seed
+
+    if root_user_id:
+        roots = [_USERS[root_user_id]] if root_user_id in _USERS else []
+    else:
+        roots = [u for u in _USERS.values() if not u.get("manager_user_id") and u.get("is_active", True)]
+
+    visited = set()
+
+    def _build(uid, depth):
+        if depth > max_depth or uid in visited:
+            return None
+        visited.add(uid)
+        u = _USERS.get(uid)
+        if not u:
+            return None
+        kids = [_build(k["user_id"], depth + 1) for k in get_reports(uid)]
+        return {
+            "user_id": u["user_id"],
+            "name": u.get("name"),
+            "role": u.get("role"),
+            "department": u.get("department"),
+            "email": u.get("email"),
+            "reports": [k for k in kids if k],
+        }
+
+    return {
+        "tree": [t for t in (_build(r["user_id"], 0) for r in roots) if t],
+        "total_users": len([u for u in _USERS.values() if u.get("is_active", True)]),
+    }
+
+
 def list_users(filter_role: str = None, search: str = None, limit: int = 200) -> dict:
     # Make sure the demo seed has been triggered at least once
     _ensure_user("demo-user")
