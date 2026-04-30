@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -2309,6 +2309,57 @@ def calendar_nudges():
     limit = int(data.get("limit", 10))
     user_nudges = [n for n in NUDGE_LOG if n["employee_id"] == user_id]
     return jsonify({"nudges": user_nudges[-limit:], "count": len(user_nudges)})
+
+
+# ─────────────────────────────────────────────
+# V3 — Team (manager view of team learning progress)
+# Phase 1 storage: hardcoded demo team for `demo-user` manager.
+# Phase D: real org structure via Workspace Directory API or HRIS.
+# ─────────────────────────────────────────────
+
+@app.route("/team/list", methods=["POST"])
+def team_list():
+    """Manager's direct reports + summary stats. Body: { manager_id }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    manager_id = data.get("manager_id", "demo-user")
+    return jsonify(team.list_team(manager_id=manager_id))
+
+
+@app.route("/team/member", methods=["POST"])
+def team_member():
+    """Detailed view of one report. Body: { manager_id, member_id }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    manager_id = data.get("manager_id", "demo-user")
+    member_id = data.get("member_id")
+    if not member_id:
+        return jsonify({"error": "member_id required"}), 400
+    return jsonify(team.get_team_member(manager_id=manager_id, member_id=member_id))
+
+
+@app.route("/team/kudos", methods=["POST"])
+def team_kudos():
+    """Manager sends kudos to a report. Body: { manager_id, report_id, message? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(team.send_kudos(
+        manager_id=data.get("manager_id", "demo-user"),
+        report_id=data.get("report_id"),
+        message=data.get("message", ""),
+    ))
+
+
+@app.route("/team/kudos_sent", methods=["POST"])
+def team_kudos_sent():
+    """Manager's log of kudos sent. Body: { manager_id }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(team.list_kudos_sent(manager_id=data.get("manager_id", "demo-user")))
 
 
 # ─────────────────────────────────────────────
