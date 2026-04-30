@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2402,6 +2402,60 @@ def admin_users_import_csv():
     data = request.json or {}
     csv_text = data.get("csv", "")
     return jsonify(rbac.import_users_csv(actor, csv_text))
+
+
+@app.route("/admin/reports/list", methods=["POST"])
+def admin_reports_list():
+    """List available reports + descriptions."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "report:run"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    return jsonify(reports.list_reports())
+
+
+@app.route("/admin/reports/run", methods=["POST"])
+@audit_action(
+    "report:run",
+    target_fn=lambda req, _resp: f"report:{(req.get_json(silent=True) or {}).get('report_id', '?')}",
+    details_fn=lambda req, _resp: {"filters": (req.get_json(silent=True) or {}).get("filters") or {}},
+)
+def admin_reports_run():
+    """Run a report. Body: { report_id, filters? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "report:run"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    report_id = data.get("report_id")
+    if not report_id:
+        return jsonify({"error": "report_id required"}), 400
+    return jsonify(reports.run(report_id, data.get("filters") or {}))
+
+
+@app.route("/admin/reports/export_csv", methods=["POST"])
+@audit_action(
+    "report:export",
+    target_fn=lambda req, _resp: f"report:{(req.get_json(silent=True) or {}).get('report_id', '?')}",
+)
+def admin_reports_export_csv():
+    """Export a report as CSV. Body: { report_id, filters? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "report:export"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    report_id = data.get("report_id")
+    if not report_id:
+        return jsonify({"error": "report_id required"}), 400
+    csv_text = reports.export_csv(report_id, data.get("filters") or {})
+    return jsonify({
+        "csv": csv_text,
+        "filename": f"aasan-report-{report_id}-{datetime.utcnow().date().isoformat()}.csv",
+    })
 
 
 @app.route("/admin/audit_log", methods=["POST"])

@@ -64,7 +64,9 @@ ROLE_PERMISSIONS = {
                          "compliance:view_all", "compliance:assign_mandatory"},
     "org_admin":        {"admin:users", "admin:modules", "admin:branding",
                          "admin:sso", "admin:billing", "admin:audit_log",
-                         "scim:provision"},
+                         "scim:provision",
+                         "report:run", "report:export",
+                         "team:view_all"},
     "super_admin":      {"*"},
 }
 
