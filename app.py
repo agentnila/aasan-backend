@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac
 
 app = Flask(__name__)
 CORS(app)  # Allow all origins — needed for browser graph visualisation
@@ -2309,6 +2309,69 @@ def calendar_nudges():
     limit = int(data.get("limit", 10))
     user_nudges = [n for n in NUDGE_LOG if n["employee_id"] == user_id]
     return jsonify({"nudges": user_nudges[-limit:], "count": len(user_nudges)})
+
+
+# ─────────────────────────────────────────────
+# V3 — RBAC + Admin Console (Internal Pilot Pack · Phase A)
+# Identity model: actor user_id pulled from X-Aasan-User header or
+# JSON body. Phase 2 will parse Clerk JWTs; Phase 1 trusts client.
+# ─────────────────────────────────────────────
+
+@app.route("/admin/me", methods=["POST", "GET"])
+def admin_me():
+    """Active user's identity + role + module visibility for UI gating."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    user_id = rbac.get_actor_user_id(request)
+    return jsonify(rbac.me(user_id))
+
+
+@app.route("/admin/users/list", methods=["POST"])
+def admin_users_list():
+    """List users in the org. Body: { filter_role?, search?, limit? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    return jsonify(rbac.list_users(
+        filter_role=data.get("filter_role"),
+        search=data.get("search"),
+        limit=int(data.get("limit", 200)),
+    ))
+
+
+@app.route("/admin/users/set_role", methods=["POST"])
+def admin_users_set_role():
+    """Body: { target_user_id, role }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    target = data.get("target_user_id")
+    new_role = data.get("role")
+    if not (target and new_role):
+        return jsonify({"error": "target_user_id and role required"}), 400
+    return jsonify(rbac.set_role(actor, target, new_role))
+
+
+@app.route("/admin/users/update", methods=["POST"])
+def admin_users_update():
+    """Body: { target_user_id, fields: {name?, email?, department?, manager_user_id?, is_active?} }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden", "your_role": rbac.get_role(actor)}), 403
+    data = request.json or {}
+    target = data.get("target_user_id")
+    fields = data.get("fields") or {}
+    if not target:
+        return jsonify({"error": "target_user_id required"}), 400
+    return jsonify(rbac.update_user(actor, target, fields))
 
 
 # ─────────────────────────────────────────────
