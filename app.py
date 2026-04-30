@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2590,6 +2590,154 @@ def gigs_leaderboard():
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
     return jsonify(gigs.points_leaderboard(limit=int(data.get("limit", 10))))
+
+
+# ─────────────────────────────────────────────
+# SCIM v2 — Phase G of Internal Pilot Pack.
+# Okta-compatible provisioning. Bearer token auth (separate from
+# the Aasan secret used by the React app).
+# ─────────────────────────────────────────────
+
+def _scim_response(payload, default_status=200):
+    """Render a SCIM dict as a Flask response with the right status + content-type."""
+    status = payload.pop("_status_code", default_status) if isinstance(payload, dict) else default_status
+    resp = jsonify(payload)
+    resp.headers["Content-Type"] = "application/scim+json"
+    return resp, status
+
+
+def _require_scim_auth():
+    if not scim.verify_bearer(request):
+        body = scim.scim_error(401, "Invalid or missing Bearer token")
+        body.pop("_status_code", None)
+        resp = jsonify(body)
+        resp.headers["Content-Type"] = "application/scim+json"
+        return resp, 401
+    return None
+
+
+@app.route("/scim/v2/ServiceProviderConfig", methods=["GET"])
+def scim_spc():
+    auth_err = _require_scim_auth()
+    if auth_err: return auth_err
+    return _scim_response(scim.service_provider_config())
+
+
+@app.route("/scim/v2/ResourceTypes", methods=["GET"])
+def scim_resource_types():
+    auth_err = _require_scim_auth()
+    if auth_err: return auth_err
+    return _scim_response(scim.resource_types())
+
+
+@app.route("/scim/v2/Schemas", methods=["GET"])
+def scim_schemas():
+    auth_err = _require_scim_auth()
+    if auth_err: return auth_err
+    return _scim_response(scim.schemas())
+
+
+@app.route("/scim/v2/Users", methods=["GET", "POST"])
+def scim_users():
+    auth_err = _require_scim_auth()
+    if auth_err: return auth_err
+    if request.method == "GET":
+        flt = request.args.get("filter")
+        start_index = int(request.args.get("startIndex", 1))
+        count = int(request.args.get("count", 100))
+        return _scim_response(scim.list_users(scim_filter=flt, start_index=start_index, count=count))
+    # POST — create
+    payload = request.get_json(silent=True) or {}
+    result = scim.create_user(payload)
+    if "_status_code" in result:
+        return _scim_response(result)
+    audit_log.record(
+        actor_user_id="scim:idp",
+        action="scim:create",
+        target=f"user:{result.get('id', '?')}",
+        details={"userName": payload.get("userName"), "title": payload.get("title")},
+    )
+    return _scim_response(result, default_status=201)
+
+
+@app.route("/scim/v2/Users/<user_id>", methods=["GET", "PUT", "PATCH", "DELETE"])
+def scim_user_one(user_id):
+    auth_err = _require_scim_auth()
+    if auth_err: return auth_err
+    if request.method == "GET":
+        return _scim_response(scim.get_user(user_id))
+    if request.method == "PUT":
+        result = scim.replace_user(user_id, request.get_json(silent=True) or {})
+        audit_log.record(
+            actor_user_id="scim:idp", action="scim:replace",
+            target=f"user:{user_id}", details={},
+        )
+        return _scim_response(result)
+    if request.method == "PATCH":
+        result = scim.patch_user(user_id, request.get_json(silent=True) or {})
+        audit_log.record(
+            actor_user_id="scim:idp", action="scim:patch",
+            target=f"user:{user_id}",
+            details={"ops": [{"op": o.get("op"), "path": o.get("path")} for o in (request.get_json(silent=True) or {}).get("Operations", [])]},
+        )
+        return _scim_response(result)
+    if request.method == "DELETE":
+        result = scim.delete_user(user_id)
+        if "_status_code" in result:
+            return _scim_response(result)
+        audit_log.record(
+            actor_user_id="scim:idp", action="scim:delete",
+            target=f"user:{user_id}", details={},
+        )
+        return ("", 204)
+
+
+# ─────────────────────────────────────────────
+# Admin SCIM management — token issuance + sync log
+# Uses the standard Aasan secret + admin:sso permission
+# ─────────────────────────────────────────────
+
+@app.route("/admin/scim/issue_token", methods=["POST"])
+def admin_scim_issue_token():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    result = scim.issue_token(actor, label=data.get("label", ""))
+    if not result.get("error"):
+        audit_log.record(actor, "admin:scim_token_issued", "scim:token", {"label": result.get("label")})
+    return jsonify(result), (403 if result.get("error") == "forbidden — admin:sso required" else 200)
+
+
+@app.route("/admin/scim/list_tokens", methods=["POST"])
+def admin_scim_list_tokens():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    return jsonify(scim.list_tokens(actor))
+
+
+@app.route("/admin/scim/revoke_token", methods=["POST"])
+def admin_scim_revoke_token():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    result = scim.revoke_token(actor, data.get("preview", ""))
+    if result.get("ok"):
+        audit_log.record(actor, "admin:scim_token_revoked", "scim:token", {})
+    return jsonify(result)
+
+
+@app.route("/admin/scim/sync_log", methods=["POST"])
+def admin_scim_sync_log():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:sso", "admin:audit_log"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    return jsonify({"entries": scim.get_sync_log(limit=int(data.get("limit", 50)))})
 
 
 @app.route("/admin/onboarding/templates", methods=["POST"])
