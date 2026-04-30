@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2456,6 +2456,68 @@ def admin_reports_export_csv():
         "csv": csv_text,
         "filename": f"aasan-report-{report_id}-{datetime.utcnow().date().isoformat()}.csv",
     })
+
+
+@app.route("/admin/onboarding/templates", methods=["POST"])
+def admin_onboarding_templates():
+    """List all onboarding templates."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users", "report:run"):
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify(onboarding.list_templates())
+
+
+@app.route("/admin/onboarding/templates/get", methods=["POST"])
+def admin_onboarding_template_get():
+    """Body: { slug }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users", "report:run"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    slug = data.get("slug", "general")
+    return jsonify(onboarding.get_template_full(slug))
+
+
+@app.route("/admin/onboarding/templates/set", methods=["POST"])
+@audit_action("admin:onboarding_template_set", target_fn=lambda req, _resp: f"template:{(req.get_json(silent=True) or {}).get('slug', '?')}")
+def admin_onboarding_template_set():
+    """Body: { slug, template }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    slug = data.get("slug")
+    template = data.get("template") or {}
+    if not slug:
+        return jsonify({"error": "slug required"}), 400
+    return jsonify(onboarding.set_template(
+        actor_role_check_fn=lambda: rbac.has_any_permission(actor, "admin:users"),
+        job_role=slug,
+        template=template,
+    ))
+
+
+@app.route("/admin/onboarding/apply", methods=["POST"])
+@audit_action("admin:onboarding_apply", target_fn=lambda req, _resp: f"user:{(req.get_json(silent=True) or {}).get('user_id', '?')}")
+def admin_onboarding_apply():
+    """Manually apply an onboarding template to a user. Body: { user_id, job_role }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    user_id = data.get("user_id")
+    job_role = data.get("job_role", "general")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    return jsonify(onboarding.apply_onboarding(user_id, job_role))
 
 
 @app.route("/admin/skill_heatmap", methods=["POST"])

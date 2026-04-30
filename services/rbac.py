@@ -275,10 +275,10 @@ def set_role(actor_user_id: str, target_user_id: str, new_role: str) -> dict:
 
 
 CSV_SAMPLE = (
-    "email,name,role,department,manager_email,is_active\n"
-    "priya.singh@example.com,Priya Singh,manager,Platform Engineering,balaji@example.com,true\n"
-    "david.kim@example.com,David Kim,learner,Platform Engineering,priya.singh@example.com,true\n"
-    "raj.kumar@example.com,Raj Kumar,ld_admin,People & Learning,balaji@example.com,true\n"
+    "email,name,role,department,manager_email,is_active,job_role\n"
+    "priya.singh@example.com,Priya Singh,manager,Platform Engineering,balaji@example.com,true,manager\n"
+    "david.kim@example.com,David Kim,learner,Platform Engineering,priya.singh@example.com,true,software_engineer\n"
+    "raj.kumar@example.com,Raj Kumar,ld_admin,People & Learning,balaji@example.com,true,product_manager\n"
 )
 
 
@@ -326,9 +326,11 @@ def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
     updated = 0
     skipped = 0
     errors = []
+    onboarded = 0
     rows_processed = 0
     seen_emails = set()
     pending_manager_email = []  # rows whose manager_email refers to an email NOT yet in the system; we'll re-resolve at the end
+    new_user_job_roles = []  # (user_id, job_role) pairs to apply onboarding for at the end
 
     # First pass — build email → user_id index of existing + this-import users
     email_to_id = {}
@@ -367,6 +369,7 @@ def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
         manager_email_raw = (row.get("manager_email") or "").strip().lower()
         is_active_raw = (row.get("is_active") or "").strip().lower()
         is_active = (is_active_raw not in ("false", "0", "no", "n", "off"))
+        job_role = (row.get("job_role") or "").strip().lower() or None
 
         # Resolve manager_email → user_id if possible
         manager_user_id = email_to_id.get(manager_email_raw) if manager_email_raw else None
@@ -384,6 +387,8 @@ def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
                 target["manager_user_id"] = manager_user_id
             target["is_active"] = is_active
             target["updated_at"] = now
+            if job_role:
+                target["job_role"] = job_role
             updated += 1
         else:
             # Create. user_id slug from email local-part for legibility.
@@ -401,12 +406,17 @@ def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
                 "department": department,
                 "manager_user_id": manager_user_id,
                 "is_active": is_active,
+                "job_role": job_role,
                 "created_at": now,
                 "last_active_at": now,
                 "scim_external_id": None,
             }
             email_to_id[email] = user_id
             created += 1
+            # Queue onboarding application — run after the import so all
+            # users (including manager links) are in place before path
+            # engine creates goals.
+            new_user_job_roles.append((user_id, job_role or "general"))
 
     # Second pass — resolve pending manager_email references that pointed
     # at users created earlier in THIS same CSV.
@@ -421,12 +431,26 @@ def import_users_csv(actor_user_id: str, csv_text: str) -> dict:
             _USERS[child_id]["manager_user_id"] = mgr_id
             resolved_managers += 1
 
+    # Apply onboarding paths for newly-created users
+    try:
+        from . import onboarding as _onboarding
+        for uid, job_role in new_user_job_roles:
+            try:
+                result = _onboarding.apply_onboarding(uid, job_role)
+                if result.get("ok") and not result.get("skipped_reason"):
+                    onboarded += 1
+            except Exception as exc:
+                errors.append({"user_id": uid, "error": f"onboarding failed: {exc}"})
+    except ImportError:
+        pass  # onboarding module not yet loaded — skip silently
+
     return {
         "ok": True,
         "rows_processed": rows_processed,
         "created": created,
         "updated": updated,
         "skipped": skipped,
+        "onboarded": onboarded,
         "manager_links_resolved_in_second_pass": resolved_managers,
         "errors": errors,
         "total_users_after": len(_USERS),
