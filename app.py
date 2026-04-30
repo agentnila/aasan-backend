@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2456,6 +2456,140 @@ def admin_reports_export_csv():
         "csv": csv_text,
         "filename": f"aasan-report-{report_id}-{datetime.utcnow().date().isoformat()}.csv",
     })
+
+
+# ─────────────────────────────────────────────
+# V3 — Gigs marketplace (intra-enterprise cross-team work)
+# Phase F.5 of the Internal Pilot Pack.
+# ─────────────────────────────────────────────
+
+@app.route("/gigs/list", methods=["POST"])
+def gigs_list():
+    """Browse gigs. Body: { status?, skill?, department?, search?, limit? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(gigs.list_gigs(
+        status=data.get("status"),
+        skill=data.get("skill"),
+        department=data.get("department"),
+        search=data.get("search"),
+        limit=int(data.get("limit", 50)),
+    ))
+
+
+@app.route("/gigs/get", methods=["POST"])
+def gigs_get():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(gigs.get_gig(data.get("gig_id")))
+
+
+@app.route("/gigs/post", methods=["POST"])
+@audit_action(
+    "gig:post",
+    target_fn=lambda req, _resp: f"gig:{(req.get_json(silent=True) or {}).get('profile', {}).get('title', '?')}",
+    details_fn=lambda req, _resp: {"point_value": ((req.get_json(silent=True) or {}).get("profile") or {}).get("point_value")},
+)
+def gigs_post():
+    """Post a new gig. Body: { profile: {title, description, skills, point_value, ...} }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    return jsonify(gigs.post_gig(actor, data.get("profile") or {}))
+
+
+@app.route("/gigs/claim", methods=["POST"])
+@audit_action("gig:claim", target_fn=lambda req, _resp: f"gig:{(req.get_json(silent=True) or {}).get('gig_id', '?')}")
+def gigs_claim():
+    """Body: { gig_id }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    return jsonify(gigs.claim_gig(actor, data.get("gig_id")))
+
+
+@app.route("/gigs/deliver", methods=["POST"])
+@audit_action("gig:deliver", target_fn=lambda req, _resp: f"gig:{(req.get_json(silent=True) or {}).get('gig_id', '?')}")
+def gigs_deliver():
+    """Body: { gig_id, deliverable_url?, notes? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    return jsonify(gigs.deliver_gig(
+        actor, data.get("gig_id"),
+        deliverable_url=data.get("deliverable_url", ""),
+        notes=data.get("notes", ""),
+    ))
+
+
+@app.route("/gigs/review", methods=["POST"])
+@audit_action(
+    "gig:review",
+    target_fn=lambda req, _resp: f"gig:{(req.get_json(silent=True) or {}).get('gig_id', '?')}",
+    details_fn=lambda req, _resp: {"decision": (req.get_json(silent=True) or {}).get("decision")},
+)
+def gigs_review():
+    """Body: { gig_id, decision: 'accept' | 'decline', review_notes? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    return jsonify(gigs.review_gig(
+        actor, data.get("gig_id"),
+        decision=data.get("decision", ""),
+        review_notes=data.get("review_notes", ""),
+    ))
+
+
+@app.route("/gigs/cancel", methods=["POST"])
+@audit_action("gig:cancel", target_fn=lambda req, _resp: f"gig:{(req.get_json(silent=True) or {}).get('gig_id', '?')}")
+def gigs_cancel():
+    """Body: { gig_id, reason? }"""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    return jsonify(gigs.cancel_gig(actor, data.get("gig_id"), reason=data.get("reason", "")))
+
+
+@app.route("/gigs/my_posts", methods=["POST"])
+def gigs_my_posts():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    return jsonify(gigs.list_my_posts(actor))
+
+
+@app.route("/gigs/my_claims", methods=["POST"])
+def gigs_my_claims():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    return jsonify(gigs.list_my_claims(actor))
+
+
+@app.route("/gigs/points", methods=["POST"])
+def gigs_points():
+    """Current user's points balance + history. Body: { user_id? } (optional override for admin views)."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    data = request.json or {}
+    target = data.get("user_id") or actor
+    return jsonify(gigs.get_points(target))
+
+
+@app.route("/gigs/leaderboard", methods=["POST"])
+def gigs_leaderboard():
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(gigs.points_leaderboard(limit=int(data.get("limit", 10))))
 
 
 @app.route("/admin/onboarding/templates", methods=["POST"])
