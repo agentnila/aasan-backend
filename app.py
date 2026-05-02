@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -1983,12 +1983,19 @@ def drive_index():
 # Google Calendar OAuth — calendar_client returns stub busy windows for now.
 # ─────────────────────────────────────────────
 
-SCHEDULE_BLOCKS = []  # Phase 1 in-memory store; Phase 2 → Airtable Table 18
+SCHEDULE_BLOCKS = []  # In-memory list — aliased to schedule_blocks._FALLBACK below
 NUDGE_LOG = []         # Phase 1 in-memory log of dispatched 5-min-prior nudges
 _BLOCK_ID_COUNTER = [0]
 
+# Wire the schedule_blocks service to alias our in-memory list — same
+# object on both sides, so legacy reads (filter SCHEDULE_BLOCKS by user_id,
+# etc.) keep working AND new writes via schedule_blocks.add() also persist
+# to Postgres when configured. Tier 0 dual-mode pattern.
+schedule_blocks.wrap_existing_list(SCHEDULE_BLOCKS)
+
 
 def _next_block_id():
+    """Legacy helper — only used by the in-memory fallback path now."""
     _BLOCK_ID_COUNTER[0] += 1
     return _BLOCK_ID_COUNTER[0]
 
@@ -2091,9 +2098,13 @@ def calendar_book():
         description=description or f"Aasan learning session: {step_title}",
     )
 
+    goal_id = data.get("goal_id")  # nullable; frontend can pass for tighter coupling
+
     block = {
-        "block_id": _next_block_id(),
+        "block_id": _next_block_id(),  # may be overridden by Postgres bigserial
         "employee_id": user_id,
+        "user_id": user_id,
+        "goal_id": goal_id,
         "path_step_id": path_step_id,
         "step_title": step_title,
         "start_at": start_at.isoformat(),
@@ -2106,10 +2117,14 @@ def calendar_book():
         "nudge_sent_at": None,
         "reschedule_count": 0,
         "original_start_at": start_at.isoformat(),
+        "description": description,
         "created_at": datetime.utcnow().isoformat(),
         "mode": event.get("mode", "live"),
     }
-    SCHEDULE_BLOCKS.append(block)
+    persisted = schedule_blocks.add(block)
+    # add() may have re-keyed block_id with the Postgres bigserial; mirror back
+    if persisted and persisted.get("block_id"):
+        block["block_id"] = persisted["block_id"]
 
     return jsonify({
         "block_id": block["block_id"],
@@ -2205,7 +2220,7 @@ def calendar_blocks():
     data = request.json or {}
     user_id = data.get("user_id", "demo-user")
     include_past = bool(data.get("include_past", False))
-    blocks = [b for b in SCHEDULE_BLOCKS if b["employee_id"] == user_id]
+    blocks = schedule_blocks.list_for_user(user_id, include_past=include_past)
     if not include_past:
         blocks = [b for b in blocks if b["status"] in ("scheduled", "rescheduled")]
     return jsonify({"blocks": blocks, "count": len(blocks)})
