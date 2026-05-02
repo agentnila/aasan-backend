@@ -558,9 +558,14 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
         except Exception as exc:
             logger.warning("Initial path generation failed for %s/%s (%s)", user_id, goal_id, exc)
 
-    # Re-read the entry — _generate_initial_path may have populated steps
-    entry = user_data[goal_id]
-    return {"goal_id": goal_id, "goal": entry["goal"], "path": entry["path"], "created": True}
+    # CRITICAL: re-read from _STORE (NOT from the local `user_data` variable)
+    # because _generate_initial_path → _ensure_user() may have rebuilt
+    # _STORE[user_id] from Postgres, leaving our local user_data reference
+    # pointing at the pre-generation dict with the empty path. Reading from
+    # _STORE always gets the freshest mutated entry. Fall back to user_data
+    # if for some reason _STORE doesn't have it.
+    fresh_entry = _STORE.get(user_id, {}).get(goal_id) or user_data.get(goal_id)
+    return {"goal_id": goal_id, "goal": fresh_entry["goal"], "path": fresh_entry["path"], "created": True}
 
 
 def _generate_initial_path(user_id: str, goal_id: str) -> None:
