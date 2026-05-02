@@ -3134,7 +3134,6 @@ def diag_vector_status():
     # 2. What does Pinecone's index report?
     try:
         from pinecone import Pinecone
-        import os
         pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
         idx = pc.Index(os.environ.get("PINECONE_INDEX", ""))
         stats = idx.describe_index_stats()
@@ -3150,7 +3149,6 @@ def diag_vector_status():
     try:
         v = embeddings.embed_text("diagnostic probe upsert")
         from pinecone import Pinecone
-        import os
         pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
         idx = pc.Index(os.environ.get("PINECONE_INDEX", ""))
         idx.upsert(vectors=[("diag-probe-1", v, {"diag": True})])
