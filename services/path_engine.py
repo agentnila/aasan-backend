@@ -924,8 +924,10 @@ def recompute(user_id: str, goal_id: str, trigger: str, trigger_payload: dict = 
     path["recompute_history"].insert(0, history_entry)
     path["recompute_history"] = path["recompute_history"][:10]  # cap log
 
-    # 5. Recompute progress + current step
-    _recompute_progress(path)
+    # 5. Recompute progress + current step + readiness
+    prev_readiness = int(entry["goal"].get("readiness") or 0)
+    _recompute_progress(path, entry["goal"])
+    new_readiness = int(entry["goal"].get("readiness") or 0)
 
     # 6. Persist back to Postgres (no-op when fallback)
     _persist_goal_path(user_id, goal_id)
@@ -955,6 +957,9 @@ def recompute(user_id: str, goal_id: str, trigger: str, trigger_payload: dict = 
             "current_step_title": _find_step(path, path["current_step_id"], "title"),
             "total_steps": len(path["steps"]),
         },
+        "readiness_before": prev_readiness,
+        "readiness_after": new_readiness,
+        "readiness_delta": new_readiness - prev_readiness,
         "recomputed_at": now,
         "mode": "live" if claude_client.is_live() else "stub",
     }
@@ -1003,9 +1008,19 @@ def mark_step_done(user_id: str, goal_id: str, step_id: str, mastery: float = No
         step["mastery_at_completion"] = round(float(mastery), 2)
     if duration_minutes is not None:
         step["actual_minutes"] = int(duration_minutes)
-    _recompute_progress(path)
+    goal = user_data[goal_id]["goal"]
+    prev_readiness = int(goal.get("readiness") or 0)
+    _recompute_progress(path, goal)
+    new_readiness = int(goal.get("readiness") or 0)
     _persist_goal_path(user_id, goal_id)
-    return {"goal_id": goal_id, "step_id": step_id, "status": "done", "progress_pct": path["progress_pct"]}
+    return {
+        "goal_id": goal_id,
+        "step_id": step_id,
+        "status": "done",
+        "progress_pct": path["progress_pct"],
+        "readiness": new_readiness,
+        "readiness_delta": new_readiness - prev_readiness,
+    }
 
 
 def skip_step(user_id: str, goal_id: str, step_id: str, reason: str = "") -> dict:
@@ -1020,7 +1035,8 @@ def skip_step(user_id: str, goal_id: str, step_id: str, reason: str = "") -> dic
     step["inserted_by"] = "learner"  # mark sacred — engine won't unskip
     step["skipped_reason"] = reason
     step["skipped_at"] = datetime.utcnow().isoformat()
-    _recompute_progress(path)
+    goal = user_data[goal_id]["goal"]
+    _recompute_progress(path, goal)
     history_entry = {
         "date": datetime.utcnow().isoformat()[:10],
         "trigger": "learner_edit",
@@ -1163,20 +1179,21 @@ def _apply_diff(path: dict, diff: dict):
     path["steps"].sort(key=lambda s: s.get("order", 999))
 
 
-def _recompute_progress(path: dict):
+def _recompute_progress(path: dict, goal: dict | None = None):
     """
     Update progress_pct + current_step_id based on step statuses, and
     auto-promote the next pending step to active when nothing else is.
 
-    The auto-promote rule is what turns "mark step done" into a complete
-    user loop instead of leaving the next step in limbo. Without this, a
-    user marks done and current_step_id moves but the new "current" step
-    still has status='pending' — visually identical to all the other
-    pending steps. The promotion makes the next-up step visibly the
-    focus.
+    When `goal` is passed, also recompute the goal's readiness score using
+    the live composite formula. This is the function every state-change
+    path goes through (mark_step_done, skip_step, recompute), so passing
+    `goal` here means readiness reflects actual learner state instead of
+    sitting at whatever the user typed at goal creation.
 
-    Sort by step_order so promotion respects path ordering, not insertion
-    order (engine inserts at fractional orders like 5.5).
+    The auto-promote rule is what turns "mark step done" into a complete
+    user loop instead of leaving the next step in limbo. Sort by step_order
+    so promotion respects path ordering, not insertion order (engine
+    inserts at fractional orders like 5.5).
     """
     sorted_steps = sorted(path["steps"], key=lambda s: float(s.get("order") or 0))
 
@@ -1197,6 +1214,108 @@ def _recompute_progress(path: dict):
     active = next((s for s in sorted_steps if s["status"] == "active"), None)
     pending = next((s for s in sorted_steps if s["status"] == "pending"), None)
     path["current_step_id"] = (active or pending or {}).get("id", path.get("current_step_id"))
+
+    # Recompute readiness when we have the goal in hand
+    if goal is not None:
+        new_readiness = _compute_readiness(path, goal)
+        prev_readiness = int(goal.get("readiness") or 0)
+        if new_readiness != prev_readiness:
+            goal["readiness"] = new_readiness
+            delta = new_readiness - prev_readiness
+            if delta > 0:
+                goal["delta"] = f"+{delta} this update"
+            elif delta < 0:
+                goal["delta"] = f"{delta} this update"
+            else:
+                goal["delta"] = "no change"
+
+
+def _compute_readiness(path: dict, goal: dict) -> int:
+    """
+    Compute a learner's readiness score for a goal as a composite signal,
+    on a 0-100 scale (higher = more ready).
+
+    Components:
+      • completion (50%) — % of path steps marked done
+      • mastery    (30%) — avg mastery_at_completion across done steps
+      • momentum   (10%) — recent activity (steps completed in last 30 days
+                            relative to the path's typical pace)
+      • time_press (10%) — days_left vs estimated remaining minutes
+
+    Each component is on 0-100. Final score is a weighted sum, clamped.
+
+    A path with zero done steps and no mastery captured returns ~0-15
+    depending on time pressure; a path mostly complete with high mastery
+    pushes 80-95. Calibrated so the demo seed (4 done of 12 with mastery
+    ~0.75) reads ~50, matching the "halfway there" intuition.
+
+    Returns int 0-100. Defensive against missing fields, malformed steps.
+    """
+    steps = path.get("steps") or []
+    total = len(steps)
+    if total == 0:
+        return 0
+
+    done_steps = [s for s in steps if s.get("status") == "done"]
+
+    # 1. Completion — straightforward
+    completion = (len(done_steps) / total) * 100
+
+    # 2. Mastery — average across done steps that have mastery captured.
+    #    If no mastery has been captured yet but steps are done, use 0.6
+    #    as a conservative default (some learning happened, but unmeasured).
+    mastered = [
+        float(s.get("mastery_at_completion"))
+        for s in done_steps
+        if s.get("mastery_at_completion") is not None
+    ]
+    if mastered:
+        mastery = (sum(mastered) / len(mastered)) * 100
+    elif done_steps:
+        mastery = 60.0  # fallback when steps marked done without mastery measure
+    else:
+        mastery = 0.0
+
+    # 3. Momentum — count steps completed in the last 30d. Treat completing
+    #    >=3 in last 30d as full momentum (100), 0 as nothing (0), linear in
+    #    between. Steps without completed_at are ignored.
+    from datetime import datetime, timedelta
+    cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+    recent_done = sum(
+        1 for s in done_steps
+        if (s.get("completed_at") or "") >= cutoff
+    )
+    momentum = min(100.0, (recent_done / 3.0) * 100.0)
+
+    # 4. Time pressure — when the goal has a known deadline, score based on
+    #    whether remaining estimated time fits in remaining days. If there's
+    #    no deadline, treat as neutral (50). Score formula: more buffer time
+    #    => higher score (less anxiety inducing).
+    days_left = goal.get("days_left")
+    pending_steps = [s for s in steps if s.get("status") in ("pending", "active")]
+    remaining_minutes = sum(int(s.get("estimated_minutes") or 0) for s in pending_steps)
+    if days_left is None:
+        time_press = 50.0  # neutral if no deadline
+    elif days_left <= 0:
+        time_press = 0.0   # past deadline
+    else:
+        # Assume ~30 min/day sustainable pace; buffer ratio = available / needed
+        available_minutes = days_left * 30
+        if remaining_minutes <= 0:
+            time_press = 100.0
+        else:
+            ratio = available_minutes / remaining_minutes
+            # ratio >= 2 → ample time (100); ratio < 0.5 → severely behind (0)
+            time_press = max(0.0, min(100.0, (ratio - 0.5) * (100.0 / 1.5)))
+
+    # Weighted composite
+    score = (
+        completion * 0.50
+        + mastery   * 0.30
+        + momentum  * 0.10
+        + time_press * 0.10
+    )
+    return max(0, min(100, int(round(score))))
 
 
 def _find_step(path: dict, step_id: str, field: str = None):
