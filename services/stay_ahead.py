@@ -60,8 +60,10 @@ DEMO_PROFILE = {
 def run_stay_ahead(user_id: str = None, profile: dict = None) -> dict:
     """
     Top-level Stay Ahead scan. Produces a 5-section career mobility digest.
+    Partial profiles passed by callers are merged on top of DEMO_PROFILE so
+    that downstream code can rely on every field being present.
     """
-    profile = profile or DEMO_PROFILE
+    profile = {**DEMO_PROFILE, **(profile or {})}
 
     if perplexity_client.is_live():
         return _live_stay_ahead(user_id, profile)

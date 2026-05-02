@@ -52,8 +52,16 @@ DEFAULT_SCENARIOS = [
 def run_simulation(user_id: str = None, scenarios: list = None, profile: dict = None) -> dict:
     """
     Project outcomes across scenarios. Returns side-by-side comparable projections.
+
+    Scenarios may arrive as either a list of dicts (full shape) or a list of
+    strings (just names — frontend convenience). Strings are coerced to dicts
+    with the name as both id and name; missing fields fall back to the matching
+    DEFAULT_SCENARIO when the id matches one we know.
     """
-    scenarios = scenarios or DEFAULT_SCENARIOS
+    if not scenarios:
+        scenarios = DEFAULT_SCENARIOS
+    else:
+        scenarios = _normalize_scenarios(scenarios)
 
     if claude_client.is_live():
         # Phase 2: real Claude reasoning over scenarios + profile + market state
@@ -61,6 +69,35 @@ def run_simulation(user_id: str = None, scenarios: list = None, profile: dict = 
         pass
 
     return _stub_simulation(user_id, scenarios, profile or {})
+
+
+def _normalize_scenarios(raw: list) -> list:
+    """Coerce mixed string/dict input into the canonical scenario dict shape."""
+    out = []
+    defaults_by_id = {s["id"]: s for s in DEFAULT_SCENARIOS}
+    for item in raw or []:
+        if isinstance(item, str):
+            slug = item.lower().replace(" ", "-")[:40]
+            base = defaults_by_id.get(slug, {})
+            out.append({
+                "id": slug,
+                "name": item,
+                "description": base.get("description", item),
+                "effort_hours_per_week": base.get("effort_hours_per_week", 5),
+                "horizon_months": base.get("horizon_months", 18),
+            })
+        elif isinstance(item, dict):
+            sid = item.get("id") or item.get("name", "scenario").lower().replace(" ", "-")[:40]
+            base = defaults_by_id.get(sid, {})
+            merged = {
+                "id": sid,
+                "name": item.get("name") or sid,
+                "description": item.get("description") or base.get("description", ""),
+                "effort_hours_per_week": item.get("effort_hours_per_week") or base.get("effort_hours_per_week", 5),
+                "horizon_months": item.get("horizon_months") or base.get("horizon_months", 18),
+            }
+            out.append(merged)
+    return out or DEFAULT_SCENARIOS
 
 
 def _stub_simulation(user_id: str, scenarios: list, profile: dict) -> dict:

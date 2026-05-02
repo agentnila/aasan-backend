@@ -236,7 +236,7 @@ def list_items(
             params.append(status)
         if tag:
             needle = tag.lstrip("#").lower()
-            clauses.append("EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(t) = %s)")
+            clauses.append("EXISTS (SELECT 1 FROM unnest(tags) t WHERE LOWER(LTRIM(t, '#')) = %s)")
             params.append(needle)
         if owner:
             clauses.append("owner = %s")
@@ -297,7 +297,7 @@ def list_items(
         items = [i for i in items if i["status"] == status]
     if tag:
         needle = tag.lstrip("#").lower()
-        items = [i for i in items if needle in [t.lower() for t in (i.get("tags") or [])]]
+        items = [i for i in items if needle in [t.lstrip("#").lower() for t in (i.get("tags") or [])]]
     if owner:
         items = [i for i in items if i.get("owner") == owner]
     if parent_ship_date:
