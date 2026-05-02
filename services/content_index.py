@@ -358,15 +358,88 @@ def embed_pending(limit: int = 200, force: bool = False) -> dict:
         else:
             rows = [r for r in _FALLBACK.values() if not r.get("embedding_id")][:int(limit)]
 
+    if not rows:
+        return {"processed": 0, "embedded": 0, "failed": 0, "errors": []}
+
+    # Batch embed — Voyage supports up to 128 inputs per request, so 200 rows
+    # become at most 2 calls. Avoids per-row 429 rate-limiting that earlier
+    # caused silent fallback to the 512-dim stub vectors. Earned 2026-05-02
+    # when 69 sequential calls hit Voyage's per-minute limit.
+    BATCH = 100
+    errors: list[dict] = []
     embedded = 0
     failed = 0
-    for r in rows:
-        eid = embed_one(r)
-        if eid:
+
+    for batch_start in range(0, len(rows), BATCH):
+        batch = rows[batch_start:batch_start + BATCH]
+        texts = [_compose_embed_text(r) for r in batch]
+
+        # One Voyage call for the whole batch — surface real errors, no silent stub fallback
+        try:
+            from . import embeddings as _emb
+            if not _emb.is_live():
+                errors.append({"batch_start": batch_start, "msg": "VOYAGE_API_KEY not set"})
+                failed += len(batch)
+                continue
+            vectors = _emb._embed_live(texts)
+        except Exception as exc:
+            errors.append({"batch_start": batch_start, "msg": f"Voyage batch failed: {exc}"})
+            failed += len(batch)
+            continue
+
+        if len(vectors) != len(batch):
+            errors.append({"batch_start": batch_start, "msg": f"Voyage returned {len(vectors)} vectors for {len(batch)} inputs"})
+            failed += len(batch)
+            continue
+
+        # Upsert each vector to Pinecone, persist embedding_id
+        for r, vector in zip(batch, vectors):
+            cid = r.get("content_id")
+            if not cid:
+                failed += 1
+                continue
+            metadata = {
+                "source": r.get("source"),
+                "is_free": bool(r.get("is_free")),
+                "difficulty": r.get("difficulty"),
+                "content_type": r.get("content_type"),
+                "title": (r.get("title") or "")[:200],
+            }
+            eid = _vector_id(cid)
+            try:
+                vector_index.upsert(eid, vector, metadata)
+            except Exception as exc:
+                errors.append({"content_id": cid, "msg": f"Pinecone upsert: {exc}"})
+                failed += 1
+                continue
+
+            if db.is_enabled():
+                try:
+                    db.execute(
+                        "UPDATE content_index SET embedding_id = %s, last_synced_at = now() WHERE content_id = %s",
+                        (eid, cid),
+                    )
+                except Exception as exc:
+                    logger.warning("content embedding_id persist failed (%s)", exc)
+            if cid in _FALLBACK:
+                _FALLBACK[cid]["embedding_id"] = eid
+                _FALLBACK[cid]["last_synced_at"] = _now_iso()
             embedded += 1
-        else:
-            failed += 1
-    return {"processed": len(rows), "embedded": embedded, "failed": failed}
+
+    return {"processed": len(rows), "embedded": embedded, "failed": failed, "errors": errors}
+
+
+def _compose_embed_text(row: dict) -> str:
+    """Same composition as embed_one — extracted so embed_pending can batch."""
+    parts = [
+        row.get("title", ""),
+        row.get("description", ""),
+        f"Skills: {', '.join(row.get('skills') or [])}" if row.get("skills") else "",
+        f"Prerequisites: {', '.join(row.get('prerequisites') or [])}" if row.get("prerequisites") else "",
+        f"Source: {row.get('source', '')}" if row.get("source") else "",
+        f"Difficulty: {row.get('difficulty', '')}" if row.get("difficulty") else "",
+    ]
+    return "\n".join(p for p in parts if p)
 
 
 def load_seed(seed_path: str, actor: str | None = "system-seed") -> dict:
