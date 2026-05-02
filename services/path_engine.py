@@ -248,7 +248,8 @@ def _load_user_from_pg(user_id: str) -> dict:
             """
             SELECT step_id, step_order, title, step_type, status,
                    estimated_minutes, actual_minutes, mastery_at_completion,
-                   inserted_by, inserted_reason, completed_at, inserted_at
+                   inserted_by, inserted_reason, completed_at, inserted_at,
+                   content_url, content_provider, content_title, content_id
             FROM path_steps
             WHERE user_id = %s AND goal_id = %s
             ORDER BY step_order
@@ -333,7 +334,8 @@ def _row_to_step(row: dict) -> dict:
         "status": row.get("status", "pending"),
     }
     for opt in ("estimated_minutes", "actual_minutes", "mastery_at_completion",
-                "inserted_by", "inserted_reason"):
+                "inserted_by", "inserted_reason",
+                "content_url", "content_provider", "content_title", "content_id"):
         v = row.get(opt)
         if v is not None:
             out[opt] = float(v) if opt == "mastery_at_completion" else v
@@ -433,8 +435,9 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                         (user_id, goal_id, step_id, step_order, title, step_type,
                          status, estimated_minutes, actual_minutes,
                          mastery_at_completion, inserted_by, inserted_reason,
-                         completed_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         completed_at,
+                         content_url, content_provider, content_title, content_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         user_id, goal_id, step["id"],
@@ -448,6 +451,10 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                         step.get("inserted_by", "engine"),
                         step.get("inserted_reason"),
                         step.get("completed_at"),
+                        step.get("content_url"),
+                        step.get("content_provider"),
+                        step.get("content_title"),
+                        step.get("content_id"),
                     ),
                 )
     except Exception as exc:
@@ -638,8 +645,29 @@ def _generate_path_via_claude(goal: dict) -> list:
         "  - step_type: 'content' (default) | 'review' | 'refresher' | 'gap_closure' | 'assignment'\n"
         "  - First step status is 'active'; rest are 'pending'.\n"
         "  - inserted_by: 'engine'; inserted_reason: short rationale ('auto: foundation step before X').\n\n"
+        "REAL LEARNING RESOURCE per step (CRITICAL):\n"
+        "  - Each step MUST include content_url, content_provider, content_title pointing\n"
+        "    at a real, well-known, reputable learning resource that matches the step.\n"
+        "  - Prefer canonical / official sources first: official documentation\n"
+        "    (kubernetes.io, docs.aws.amazon.com, react.dev, postgresql.org/docs),\n"
+        "    AWS Skill Builder, Linux Foundation Training, freeCodeCamp,\n"
+        "    Microsoft Learn, Google Cloud Skills Boost, official YouTube channels\n"
+        "    (e.g. Anthropic, AWS, Kubernetes), reputable provider courses\n"
+        "    (Coursera with named instructor, Pluralsight, A Cloud Guru, Udacity),\n"
+        "    well-maintained OSS repos (github.com/...).\n"
+        "  - content_url should be a plausible, well-formed URL on a real domain. If\n"
+        "    you're uncertain about an exact deep-link, use the canonical landing\n"
+        "    page for the resource (the docs root, the course catalog page) rather\n"
+        "    than fabricating a fragile path.\n"
+        "  - content_provider is a short label: 'kubernetes.io' | 'AWS Skill Builder' |\n"
+        "    'Coursera' | 'YouTube' | 'GitHub' | 'official docs' | etc.\n"
+        "  - content_title is the resource's own title (may differ from step title;\n"
+        "    e.g. step 'Build mTLS with Istio', content_title 'Securing Service Mesh\n"
+        "    Traffic with mTLS — Istio docs').\n"
+        "  - NEVER invent a fake provider or a URL on a domain that isn't real.\n\n"
         "Return ONLY a JSON object: { \"steps\": [{ id, order, title, step_type, status, "
-        "estimated_minutes, inserted_by, inserted_reason }] }\n"
+        "estimated_minutes, inserted_by, inserted_reason, content_url, content_provider, "
+        "content_title }] }\n"
         "  - id format: 'step-init-N' where N is 1..len(steps)\n"
         "  - order: 1, 2, 3, ... incrementing\n"
         "No prose, no markdown fences."
@@ -672,6 +700,14 @@ def _generate_path_via_claude(goal: dict) -> list:
         title = (s.get("title") or "").strip()
         if not title:
             continue
+        # Content fields — accept only well-formed URLs (defensive against
+        # Claude returning empty strings or invalid URLs). Any of these can
+        # be None; the frontend hides the CTA when they are.
+        c_url = (s.get("content_url") or "").strip()
+        if c_url and not (c_url.startswith("http://") or c_url.startswith("https://")):
+            c_url = ""
+        c_provider = (s.get("content_provider") or "").strip() or None
+        c_title = (s.get("content_title") or "").strip() or None
         cleaned.append({
             "id": s.get("id") or f"step-init-{i}",
             "order": int(s.get("order") or i),
@@ -681,6 +717,9 @@ def _generate_path_via_claude(goal: dict) -> list:
             "estimated_minutes": int(s.get("estimated_minutes") or 30),
             "inserted_by": "engine",
             "inserted_reason": s.get("inserted_reason") or "auto: generated for new goal",
+            "content_url": c_url or None,
+            "content_provider": c_provider,
+            "content_title": c_title,
         })
     # Ensure exactly one active step (first one); the rest pending
     active_set = False
@@ -699,15 +738,16 @@ def _stub_initial_steps(goal: dict) -> list:
     Goal-aware starter template for demo mode (no Claude).
 
     Better than a blank path. Names the steps after the goal so the user
-    sees something coherent even without an API key. The Path Engine will
-    refine these once a real session fires the recompute trigger.
+    sees something coherent even without an API key. content_* fields are
+    None — stub mode doesn't fabricate URLs. The Path Engine will refine
+    these once a real session fires the recompute trigger.
     """
     name = (goal.get("name") or "your goal").strip()
     return [
-        {"id": "step-init-1", "order": 1, "title": f"Orient: what does {name} look like?", "step_type": "content", "status": "active",  "estimated_minutes": 20, "inserted_by": "engine", "inserted_reason": "auto: orientation step (stub mode — set ANTHROPIC_API_KEY to generate a real path)"},
-        {"id": "step-init-2", "order": 2, "title": f"Foundations — the core concepts behind {name}",                 "step_type": "content", "status": "pending", "estimated_minutes": 45, "inserted_by": "engine", "inserted_reason": "auto: foundations (stub mode)"},
-        {"id": "step-init-3", "order": 3, "title": f"Hands-on practice toward {name}",                               "step_type": "content", "status": "pending", "estimated_minutes": 90, "inserted_by": "engine", "inserted_reason": "auto: applied practice (stub mode)"},
-        {"id": "step-init-4", "order": 4, "title": f"Validation — demonstrate progress toward {name}",               "step_type": "review",  "status": "pending", "estimated_minutes": 60, "inserted_by": "engine", "inserted_reason": "auto: validation step (stub mode)"},
+        {"id": "step-init-1", "order": 1, "title": f"Orient: what does {name} look like?",                "step_type": "content", "status": "active",  "estimated_minutes": 20, "inserted_by": "engine", "inserted_reason": "auto: orientation step (stub mode — set ANTHROPIC_API_KEY to generate a real path)", "content_url": None, "content_provider": None, "content_title": None},
+        {"id": "step-init-2", "order": 2, "title": f"Foundations — the core concepts behind {name}",      "step_type": "content", "status": "pending", "estimated_minutes": 45, "inserted_by": "engine", "inserted_reason": "auto: foundations (stub mode)",                "content_url": None, "content_provider": None, "content_title": None},
+        {"id": "step-init-3", "order": 3, "title": f"Hands-on practice toward {name}",                    "step_type": "content", "status": "pending", "estimated_minutes": 90, "inserted_by": "engine", "inserted_reason": "auto: applied practice (stub mode)",          "content_url": None, "content_provider": None, "content_title": None},
+        {"id": "step-init-4", "order": 4, "title": f"Validation — demonstrate progress toward {name}",    "step_type": "review",  "status": "pending", "estimated_minutes": 60, "inserted_by": "engine", "inserted_reason": "auto: validation step (stub mode)",          "content_url": None, "content_provider": None, "content_title": None},
     ]
 
 
