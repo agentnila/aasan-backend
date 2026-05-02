@@ -96,16 +96,50 @@ def _build_conninfo() -> str | None:
     """
     Build a Postgres conninfo string from env vars. Returns None if vars are
     missing — caller treats this as "fallback to in-memory."
+
+    Resolution order (first hit wins):
+      1. SUPABASE_DB_URL — full conninfo or postgres:// URL pasted from
+         Supabase dashboard's Connection String view. Easiest, recommended.
+         e.g. postgresql://postgres.xxxx:PASSWORD@aws-0-us-east-1.pooler.supabase.com:5432/postgres
+      2. SUPABASE_DB_HOST + SUPABASE_DB_USER + SUPABASE_DB_PASSWORD — assemble
+         from parts. Use this when you need fine control (custom port, SSL mode).
+      3. Legacy fallback: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY — derives
+         host as db.<project_ref>.supabase.co, user=postgres. **Note:** the
+         host derived this way only resolves to IPv6, which Render's outbound
+         network cannot reach. Use the Session Pooler hostname (option 1 or 2)
+         to avoid this trap. The service_role JWT is also NOT a valid Postgres
+         password — set SUPABASE_DB_PASSWORD explicitly.
     """
+    # Path 1: full URL — easiest, recommended
+    db_url = os.environ.get("SUPABASE_DB_URL", "").strip()
+    if db_url:
+        # psycopg accepts both libpq keyword form and postgres:// URL form
+        return db_url
+
+    # Path 2: explicit pieces
+    db_host = os.environ.get("SUPABASE_DB_HOST", "").strip()
+    db_user = os.environ.get("SUPABASE_DB_USER", "").strip()
+    db_password = os.environ.get("SUPABASE_DB_PASSWORD", "").strip()
+    db_port = os.environ.get("SUPABASE_DB_PORT", "5432").strip()
+    db_name = os.environ.get("SUPABASE_DB_NAME", "").strip() or "postgres"
+    sslmode = os.environ.get("SUPABASE_SSLMODE", "").strip() or "require"
+
+    if db_host and db_user and db_password:
+        return (
+            f"host={db_host} port={db_port} dbname={db_name} "
+            f"user={db_user} password={db_password} sslmode={sslmode}"
+        )
+
+    # Path 3: legacy fallback — derive from SUPABASE_URL. Only works when
+    # the runtime can reach IPv6 (most cloud envs cannot, including Render).
+    # Logged as a warning so misconfiguration is visible.
     url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    db_password = os.environ.get("SUPABASE_DB_PASSWORD", "").strip() or key
+    legacy_password = db_password or key
 
-    if not url or not db_password:
+    if not url or not legacy_password:
         return None
 
-    # Project ref is the subdomain of supabase.co
-    # e.g. https://xxxx.supabase.co → xxxx
     if "://" in url:
         url_no_scheme = url.split("://", 1)[1]
     else:
@@ -116,16 +150,19 @@ def _build_conninfo() -> str | None:
         return None
     project_ref = host_parts[0]
 
-    # Allow override via SUPABASE_DB_HOST (e.g. for the pooler at aws-0-*.pooler.supabase.com)
-    db_host = os.environ.get("SUPABASE_DB_HOST", "").strip() or f"db.{project_ref}.supabase.co"
-    db_port = os.environ.get("SUPABASE_DB_PORT", "5432").strip()
-    db_user = os.environ.get("SUPABASE_DB_USER", "").strip() or "postgres"
-    db_name = os.environ.get("SUPABASE_DB_NAME", "").strip() or "postgres"
-    sslmode = os.environ.get("SUPABASE_SSLMODE", "").strip() or "require"
+    derived_host = db_host or f"db.{project_ref}.supabase.co"
+    derived_user = db_user or "postgres"
+    if not db_host:
+        logger.warning(
+            "Falling back to direct hostname db.%s.supabase.co — this resolves to IPv6 only "
+            "and may be unreachable from Render. Prefer SUPABASE_DB_URL with the Session Pooler "
+            "(aws-0-<region>.pooler.supabase.com).",
+            project_ref,
+        )
 
     return (
-        f"host={db_host} port={db_port} dbname={db_name} "
-        f"user={db_user} password={db_password} sslmode={sslmode}"
+        f"host={derived_host} port={db_port} dbname={db_name} "
+        f"user={derived_user} password={legacy_password} sslmode={sslmode}"
     )
 
 
