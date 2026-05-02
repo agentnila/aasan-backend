@@ -32,6 +32,8 @@ import logging
 from datetime import datetime
 from . import claude_client, db
 from . import content_index as content_catalog
+from . import resume as _resume_svc
+from . import work_items as _work_items_svc
 
 logger = logging.getLogger(__name__)
 
@@ -697,7 +699,7 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
         candidates = _retrieve_catalog_candidates(goal, top_k=80)
         if candidates:
             try:
-                phased = _generate_phased_path_via_claude(goal, candidates)
+                phased = _generate_phased_path_via_claude(goal, candidates, user_id=user_id)
                 if phased and phased.get("steps"):
                     steps = phased["steps"]
                     phases = phased.get("phases") or []
@@ -707,7 +709,7 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
 
         # Fallback — legacy single-pass generator (Claude invents URLs, no phases)
         if not steps:
-            steps = _generate_path_via_claude(goal)
+            steps = _generate_path_via_claude(goal, user_id=user_id)
             engine_label = "Claude · legacy"
 
     if not steps:
@@ -743,6 +745,111 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
     _persist_recompute_pg(user_id, goal_id, history_entry, trigger="goal_create")
 
 
+def _compose_learner_profile(user_id: str, current_goal_id: str | None = None) -> str:
+    """
+    L5 — compact learner-context block injected into every path-gen prompt.
+
+    Pulls from existing services (no new tables, no extra storage):
+      - Resume entries (resume.list_journal)        — proven experience + skills
+      - Completed path steps across all goals       — what they've already learned
+      - Recent work items (work_items.list_items)   — what they're shipping right now
+      - Other active goals                           — adjacent paths, avoid duplication
+
+    Output is a ≤2KB markdown block — Claude uses it to:
+      - Skip foundational steps the learner has already mastered
+      - Pitch step difficulty to actual experience level
+      - Avoid recommending things that overlap an active sibling goal
+      - Ground language ("you've already shipped X — next is Y")
+
+    Empty/sparse user → empty string (no harm; Path Engine still works).
+    """
+    if not user_id:
+        return ""
+
+    parts: list[str] = ["LEARNER PROFILE (use to skip what they already know):"]
+
+    # 1) Resume — recent entries + categories
+    try:
+        journal = _resume_svc.list_journal(user_id, limit=15) or {}
+        entries = journal.get("entries") or journal.get("journal") or []
+    except Exception:
+        entries = []
+    if entries:
+        recent_lines: list[str] = []
+        for e in entries[:8]:
+            cat = e.get("category") or "skill"
+            label = (e.get("title") or e.get("text") or "").strip()[:80]
+            if not label:
+                continue
+            recent_lines.append(f"  - [{cat}] {label}")
+        if recent_lines:
+            parts.append("Resume (most recent):")
+            parts.extend(recent_lines)
+
+    # 2) Skills proven via completed path steps (across ALL goals)
+    proven_skills: dict[str, float] = {}  # title → mastery
+    try:
+        all_goals = _STORE.get(user_id, {})
+        for gid, entry in all_goals.items():
+            if gid == current_goal_id:
+                # Don't bias against the goal we're generating FOR
+                continue
+            steps = (entry.get("path") or {}).get("steps") or []
+            for s in steps:
+                if s.get("status") == "done":
+                    title = (s.get("title") or "").strip()
+                    if not title:
+                        continue
+                    mastery = float(s.get("mastery_at_completion") or 0.7)
+                    if mastery > proven_skills.get(title, 0):
+                        proven_skills[title] = mastery
+    except Exception:
+        pass
+    if proven_skills:
+        top_proven = sorted(proven_skills.items(), key=lambda kv: -kv[1])[:12]
+        parts.append("Already proficient in (from completed steps):")
+        parts.extend(f"  - {t} ({int(m*100)}% mastery)" for t, m in top_proven)
+
+    # 3) Recent work items — what they're shipping
+    try:
+        wi_resp = _work_items_svc.list_items(owner=user_id, limit=10) or {}
+        items = wi_resp.get("items") or wi_resp.get("work_items") or []
+    except Exception:
+        items = []
+    if items:
+        wi_lines: list[str] = []
+        for i in items[:6]:
+            title = (i.get("title") or i.get("name") or "").strip()[:80]
+            status = i.get("status") or ""
+            if not title:
+                continue
+            wi_lines.append(f"  - {title} [{status}]")
+        if wi_lines:
+            parts.append("Recent work shipped / in flight:")
+            parts.extend(wi_lines)
+
+    # 4) Other active goals (avoid recommending what's covered elsewhere)
+    try:
+        all_goals = _STORE.get(user_id, {})
+        sibling_goals = [
+            (entry.get("goal") or {}).get("name", "")
+            for gid, entry in all_goals.items()
+            if gid != current_goal_id
+            and (entry.get("goal") or {}).get("status") in ("active", "in_progress", None)
+        ]
+        sibling_goals = [g for g in sibling_goals if g]
+    except Exception:
+        sibling_goals = []
+    if sibling_goals:
+        parts.append("Other active goals (don't duplicate what these cover):")
+        parts.extend(f"  - {g}" for g in sibling_goals[:5])
+
+    if len(parts) == 1:
+        return ""  # nothing to add — return empty so prompt stays clean
+
+    return "\n".join(parts)
+
+
 def _retrieve_catalog_candidates(goal: dict, top_k: int = 80) -> list[dict]:
     """
     Pull top-K catalog candidates relevant to the goal via content_catalog.retrieve().
@@ -769,7 +876,7 @@ def _retrieve_catalog_candidates(goal: dict, top_k: int = 80) -> list[dict]:
         return []
 
 
-def _generate_phased_path_via_claude(goal: dict, candidates: list[dict]) -> dict | None:
+def _generate_phased_path_via_claude(goal: dict, candidates: list[dict], user_id: str | None = None) -> dict | None:
     """
     L4a — RAG-augmented path generation.
 
@@ -851,6 +958,9 @@ def _generate_phased_path_via_claude(goal: dict, candidates: list[dict]) -> dict
         "GOAL:\n" + json.dumps(goal_payload, indent=2),
         "\n\nCANDIDATES (select from these by cid only — do NOT invent):\n" + candidate_block,
     ]
+    profile_block = _compose_learner_profile(user_id, goal.get("id")) if user_id else ""
+    if profile_block:
+        user_prompt_parts.append("\n\n" + profile_block)
     if context_text:
         user_prompt_parts.append(
             "\n\nATTACHED CONTEXT (primary signal for what the path should cover):\n" + context_text
@@ -929,7 +1039,7 @@ def _generate_phased_path_via_claude(goal: dict, candidates: list[dict]) -> dict
     return {"steps": steps, "phases": phases}
 
 
-def _generate_path_via_claude(goal: dict) -> list:
+def _generate_path_via_claude(goal: dict, user_id: str | None = None) -> list:
     """Real path generation. Returns list of step dicts (or [] on error)."""
     system_prompt = (
         "You are a learning path designer for a working software engineer. "
@@ -993,6 +1103,9 @@ def _generate_path_via_claude(goal: dict) -> list:
     }
 
     user_prompt_parts = [json.dumps(goal_payload, indent=2)]
+    profile_block = _compose_learner_profile(user_id, goal.get("id")) if user_id else ""
+    if profile_block:
+        user_prompt_parts.append("\n\n" + profile_block)
     if context_text:
         provenance_bits = []
         if context_source:

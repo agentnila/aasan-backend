@@ -1444,6 +1444,119 @@ def goal_create():
     return jsonify(response)
 
 
+@app.route("/goal/assist", methods=["POST"])
+def goal_assist():
+    """
+    L5 — AI Assist for goal definition.
+
+    Conversational refinement: user clicks the ✨ button in Add Goal modal,
+    Claude asks 3-5 clarifying questions one at a time, then proposes a
+    refined goal (name + objective + success_criteria + timeline). User
+    accepts → fields auto-populate.
+
+    Body: { user_id, draft?: str, history: [{role: 'assistant'|'user', text}],
+            mode: 'next_question' | 'finalize' }
+
+    Modes:
+      next_question — given history so far, return the next clarifying
+                      question (one at a time, conversational)
+      finalize      — given history, return the final structured goal:
+                      { name, objective, success_criteria, timeline }
+
+    Reads the same _compose_learner_profile as path_engine so questions
+    can be tailored ("I see you've completed the LangChain course already
+    — looking to build on that?").
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    user_id = data.get("user_id", "demo-user")
+    mode = data.get("mode") or "next_question"
+    history = data.get("history") or []
+    draft = (data.get("draft") or "").strip()
+
+    if not claude_client.is_live():
+        # Stub response — single canned question / canned goal
+        if mode == "finalize":
+            return jsonify({
+                "goal": {
+                    "name": draft or "New learning goal",
+                    "objective": "(set by AI Assist when ANTHROPIC_API_KEY is configured)",
+                    "success_criteria": "Demonstrate working knowledge in a short project",
+                    "timeline": "60 days",
+                },
+                "_stub_reason": "ANTHROPIC_API_KEY not set",
+            })
+        return jsonify({
+            "question": "What's your current role and what specific outcome are you aiming for?",
+            "_stub_reason": "ANTHROPIC_API_KEY not set",
+        })
+
+    profile_block = path_engine._compose_learner_profile(user_id, current_goal_id=None)
+    history_str = "\n".join(
+        f"{m.get('role','user').upper()}: {(m.get('text') or '').strip()}"
+        for m in history if (m.get('text') or '').strip()
+    )
+
+    if mode == "finalize":
+        system_prompt = (
+            "You are a learning coach helping a user define their goal cleanly. "
+            "Given the conversation so far + draft + learner profile, produce a "
+            "structured goal with: name (5-12 words, action-oriented), objective "
+            "(one paragraph WHY), success_criteria (one sentence — observable), "
+            "timeline (e.g. '60 days', '3 months'). Use the learner's own words "
+            "where they were specific. Don't pad, don't moralize.\n\n"
+            "Return ONLY a JSON object: { name, objective, success_criteria, timeline }. "
+            "No prose, no markdown fences."
+        )
+        user_prompt = (
+            (f"DRAFT (initial user input):\n{draft}\n\n" if draft else "")
+            + (f"CONVERSATION SO FAR:\n{history_str}\n\n" if history_str else "")
+            + (profile_block + "\n\n" if profile_block else "")
+            + "Produce the final structured goal now."
+        )
+        response = claude_client._call_claude(
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=1024,
+        )
+        if not response:
+            return jsonify({"error": "claude unavailable"}), 503
+        parsed = claude_client._parse_json_response(response, fallback={})
+        return jsonify({"goal": parsed})
+
+    # next_question mode
+    system_prompt = (
+        "You are a learning coach helping a user define their goal cleanly before "
+        "Aasan generates a learning path. Ask ONE clarifying question at a time. "
+        "Cover: current role/context → desired outcome (specific, not 'learn AI') → "
+        "why now → timeline → how they'll know they succeeded. Reference the "
+        "learner profile if it helps personalize ('I see you've worked with X — "
+        "are you looking to extend that or pivot?'). When you have enough to "
+        "produce a clean goal (typically 3-5 turns), reply with only the literal "
+        "string DONE — the client will switch to finalize mode.\n\n"
+        "Return ONLY plain text — either one short question (no numbering, no "
+        "preamble like 'Question 3:') or the literal string DONE."
+    )
+    user_prompt = (
+        (f"DRAFT (initial user input):\n{draft}\n\n" if draft else "")
+        + (f"CONVERSATION SO FAR:\n{history_str}\n\n" if history_str else "")
+        + (profile_block + "\n\n" if profile_block else "")
+        + "Ask the next clarifying question, OR reply DONE if you have enough."
+    )
+    response = claude_client._call_claude(
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=200,
+    )
+    if not response:
+        return jsonify({"error": "claude unavailable"}), 503
+    text = (response or "").strip()
+    if text.upper() == "DONE":
+        return jsonify({"done": True})
+    return jsonify({"question": text})
+
+
 @app.route("/goal/archive", methods=["POST"])
 @audit_action("goal:archive", target_fn=target_goal)
 def goal_archive():
