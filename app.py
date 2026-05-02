@@ -3134,7 +3134,13 @@ def diag_vector_status():
         import os
         pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
         idx = pc.Index(os.environ.get("PINECONE_INDEX", ""))
-        out["pinecone_index_stats"] = idx.describe_index_stats()
+        stats = idx.describe_index_stats()
+        # Pinecone returns a non-JSON-serializable object — coerce
+        out["pinecone_index_stats"] = {
+            "dimension": getattr(stats, "dimension", None) or (stats.get("dimension") if isinstance(stats, dict) else None),
+            "total_vector_count": getattr(stats, "total_vector_count", None) or (stats.get("total_vector_count") if isinstance(stats, dict) else None),
+            "namespaces": str(getattr(stats, "namespaces", None) or (stats.get("namespaces") if isinstance(stats, dict) else None))[:500],
+        }
     except Exception as exc:
         out["pinecone_index_stats"] = f"error: {exc}"
     # 3. Try a real upsert and report the raw exception (no swallowing)
