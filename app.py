@@ -20,7 +20,7 @@ The Peraasan Agent Bridge Chrome extension is browser-side only — it does
 not talk to this backend directly.
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from neo4j import GraphDatabase
 from mem0 import MemoryClient
@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks, goal_context
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks, goal_context, content_index
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2940,6 +2940,159 @@ def admin_users_update():
     if not target:
         return jsonify({"error": "target_user_id required"}), 400
     return jsonify(rbac.update_user(actor, target, fields))
+
+
+# ─────────────────────────────────────────────
+# V3 — Content Library (the unified learning catalog)
+# Migration 0005 lands content_index per V2 Data Model Section 2 Table 03.
+# CSV upload is the integration path (per discussion 2026-05-02 — direct
+# LMS API integrations aren't viable for most of the 18 source LMSes).
+# Inline embedding via Voyage → Pinecone on each upsert.
+# ─────────────────────────────────────────────
+
+@app.route("/admin/content/csv_template", methods=["GET", "POST"])
+def admin_content_csv_template():
+    """Download a starter CSV template with header + 3 example rows."""
+    if request.method == "POST" and not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    csv_text = content_index.get_template_csv()
+    return Response(
+        csv_text,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=aasan_content_template_v1.csv"},
+    )
+
+
+@app.route("/admin/content/import_csv", methods=["POST"])
+@audit_action(
+    "admin:content_import",
+    details_fn=lambda req, resp: {"rows_processed": (resp[0].get_json() if isinstance(resp, tuple) else resp.get_json()).get("rows_processed", 0) if resp else 0},
+)
+def admin_content_import_csv():
+    """
+    Bulk import learning catalog rows.
+
+    Body shape (one of):
+      { csv_text: "external_id,source,..." }    - paste CSV text directly
+      { source_path: "seed_data/..."   }        - server reads from disk (admin-only)
+
+    Returns: { rows_processed, inserted, updated, embedded, errors }
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden — admin:users required"}), 403
+    data = request.json or {}
+    csv_text = data.get("csv_text") or ""
+    source_path = data.get("source_path")
+    if source_path:
+        # Disk-load is admin-only since it reads server-side files
+        return jsonify(content_index.load_seed(source_path, actor=actor))
+    if not csv_text:
+        return jsonify({"error": "csv_text or source_path required"}), 400
+    return jsonify(content_index.import_csv(csv_text, actor=actor))
+
+
+@app.route("/admin/content/load_seed", methods=["POST"])
+def admin_content_load_seed():
+    """Bootstrap the catalog from the bundled seed file. Idempotent."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden"}), 403
+    seed_path = (request.json or {}).get("seed_path") or "seed_data/aasan_content_seed_v1.csv"
+    return jsonify(content_index.load_seed(seed_path, actor=actor))
+
+
+@app.route("/admin/content/list", methods=["POST"])
+def admin_content_list():
+    """
+    Browse the catalog. Filters supported: source, difficulty, content_type,
+    is_free, search (substring across title/description/skills), needs_embedding.
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    return jsonify(content_index.list_for_browse(
+        filters={
+            "source": data.get("source"),
+            "difficulty": data.get("difficulty"),
+            "content_type": data.get("content_type"),
+            "is_free": data.get("is_free"),
+            "search": data.get("search"),
+            "needs_embedding": data.get("needs_embedding"),
+        },
+        limit=int(data.get("limit") or 100),
+        offset=int(data.get("offset") or 0),
+    ))
+
+
+@app.route("/admin/content/delete", methods=["POST"])
+@audit_action("admin:content_delete")
+def admin_content_delete():
+    """Remove one row from the catalog (and from Pinecone)."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    cid = data.get("content_id")
+    if cid is None:
+        return jsonify({"error": "content_id required"}), 400
+    return jsonify(content_index.delete_one(cid))
+
+
+@app.route("/admin/content/embed_pending", methods=["POST"])
+def admin_content_embed_pending():
+    """Backfill embeddings for any catalog rows where embedding_id IS NULL."""
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden"}), 403
+    data = request.json or {}
+    return jsonify(content_index.embed_pending(limit=int(data.get("limit") or 200)))
+
+
+@app.route("/content/search", methods=["POST"])
+def content_search():
+    """
+    Learner-facing read-only search of the catalog. Used by LibraryCanvas
+    and (eventually) by the Path Engine's RAG-augmented generation.
+
+    Body: { query?, source?, difficulty?, is_free?, content_type?,
+            limit?, offset?, top_k?, mode? }
+      mode='browse' (default) → list_for_browse with filters
+      mode='retrieve'         → vector retrieval (Pinecone) for path generation
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    data = request.json or {}
+    mode = data.get("mode") or "browse"
+    if mode == "retrieve":
+        results = content_index.retrieve(
+            query_text=data.get("query") or "",
+            top_k=int(data.get("top_k") or 30),
+            filters={
+                "source": data.get("source"),
+                "is_free": data.get("is_free"),
+            },
+        )
+        return jsonify({"items": results, "mode": "retrieve", "count": len(results)})
+    return jsonify(content_index.list_for_browse(
+        filters={
+            "source": data.get("source"),
+            "difficulty": data.get("difficulty"),
+            "content_type": data.get("content_type"),
+            "is_free": data.get("is_free"),
+            "search": data.get("query"),
+        },
+        limit=int(data.get("limit") or 100),
+        offset=int(data.get("offset") or 0),
+    ))
 
 
 # ─────────────────────────────────────────────
