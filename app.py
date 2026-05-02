@@ -3114,6 +3114,9 @@ def diag_vector_status():
     out = {
         "embeddings_live": embeddings.is_live(),
         "vector_index_live": vector_index.is_live(),
+        "voyage_model_active": getattr(embeddings, "VOYAGE_MODEL", "?"),
+        "voyage_model_env_raw": os.environ.get("VOYAGE_MODEL", "<unset>"),
+        "pinecone_index_env": os.environ.get("PINECONE_INDEX", "<unset>"),
         "pinecone_count": None,
         "pinecone_count_error": None,
         "voyage_dim": None,
