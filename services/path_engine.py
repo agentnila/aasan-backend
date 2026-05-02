@@ -542,7 +542,22 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
         # Update existing
         user_data[goal_id]["goal"].update({k: v for k, v in goal_input.items() if k != "id"})
         _persist_goal_path(user_id, goal_id)
-        return {"goal_id": goal_id, "goal": user_data[goal_id]["goal"], "path": user_data[goal_id]["path"], "created": False}
+
+        # If the existing goal has an empty path (e.g., it was created before
+        # the auto-generation feature landed, or a prior generation attempt
+        # bombed), regenerate it now. The user just told us about this goal
+        # again — they expect to see steps. Skip when the caller explicitly
+        # opted out via auto_generate_path: false.
+        existing_steps = (user_data[goal_id]["path"] or {}).get("steps") or []
+        if not existing_steps and goal_input.get("auto_generate_path", True):
+            try:
+                _generate_initial_path(user_id, goal_id)
+            except Exception as exc:
+                logger.warning("Initial path generation on update-existing failed for %s/%s (%s)", user_id, goal_id, exc)
+
+        # Re-read in case _generate_initial_path replaced _STORE[user_id]
+        fresh_entry = _STORE.get(user_id, {}).get(goal_id) or user_data[goal_id]
+        return {"goal_id": goal_id, "goal": fresh_entry["goal"], "path": fresh_entry["path"], "created": False}
 
     # Optional context (URL / document / image / pasted text) attached at
     # goal creation. The route handler in app.py runs goal_context.extract()
