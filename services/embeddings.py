@@ -32,7 +32,20 @@ import hashlib
 
 VOYAGE_MODEL = os.environ.get("VOYAGE_MODEL", "voyage-3")
 STUB_DIM = 512
-LIVE_DIM = 1024  # voyage-3 default
+
+# Voyage models have different output dimensions; LIVE_DIM tracks the active one.
+# Used by vector_dim() and as documentation for what the Pinecone index dim
+# must match. Default is whatever VOYAGE_MODEL emits.
+_VOYAGE_MODEL_DIMS = {
+    "voyage-3": 1024,
+    "voyage-3-lite": 512,
+    "voyage-3-large": 1536,
+    "voyage-code-3": 1024,
+    "voyage-finance-2": 1024,
+    "voyage-law-2": 1024,
+    "voyage-multilingual-2": 1024,
+}
+LIVE_DIM = _VOYAGE_MODEL_DIMS.get(VOYAGE_MODEL, 1024)
 
 
 def is_live() -> bool:
