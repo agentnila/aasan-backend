@@ -3055,7 +3055,10 @@ def admin_content_embed_pending():
     if not rbac.has_any_permission(actor, "admin:users"):
         return jsonify({"error": "forbidden"}), 403
     data = request.json or {}
-    return jsonify(content_catalog.embed_pending(limit=int(data.get("limit") or 200)))
+    return jsonify(content_catalog.embed_pending(
+        limit=int(data.get("limit") or 200),
+        force=bool(data.get("force") or False),
+    ))
 
 
 @app.route("/catalog/search", methods=["POST"])

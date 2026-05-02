@@ -321,18 +321,28 @@ def embed_one(row: dict) -> str | None:
     return eid
 
 
-def embed_pending(limit: int = 200) -> dict:
-    """Backfill embeddings for any rows where embedding_id IS NULL."""
+def embed_pending(limit: int = 200, force: bool = False) -> dict:
+    """
+    Backfill embeddings.
+
+    force=False (default) → only rows where embedding_id IS NULL.
+    force=True            → all rows, regardless. Used when the live
+                            Pinecone index is out of sync with what the
+                            DB thinks is embedded (e.g. rows were embedded
+                            against the in-memory stub before Pinecone
+                            env vars were set).
+    """
     rows: list[dict] = []
+    where_clause = "" if force else "WHERE embedding_id IS NULL"
     if db.is_enabled():
         try:
             rows = db.query(
-                """
+                f"""
                 SELECT content_id, source, title, source_url, content_type, duration_minutes,
                        description, skills, prerequisites, difficulty, is_free, language,
                        embedding_id
                 FROM content_index
-                WHERE embedding_id IS NULL
+                {where_clause}
                 ORDER BY content_id
                 LIMIT %s
                 """,
@@ -343,7 +353,10 @@ def embed_pending(limit: int = 200) -> dict:
             rows = []
 
     if not rows:
-        rows = [r for r in _FALLBACK.values() if not r.get("embedding_id")][:int(limit)]
+        if force:
+            rows = list(_FALLBACK.values())[:int(limit)]
+        else:
+            rows = [r for r in _FALLBACK.values() if not r.get("embedding_id")][:int(limit)]
 
     embedded = 0
     failed = 0
