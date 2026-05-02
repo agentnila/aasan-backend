@@ -224,7 +224,8 @@ def _load_user_from_pg(user_id: str) -> dict:
     goal_rows = db.query(
         """
         SELECT goal_id, name, objective, timeline, days_left, success_criteria,
-               priority, status, readiness, delta, assigned_by, created_at, updated_at
+               priority, status, readiness, delta, assigned_by, created_at, updated_at,
+               context_source_type, context_url, context_filename, context_mime, context_text
         FROM goals
         WHERE user_id = %s
         ORDER BY created_at
@@ -288,6 +289,12 @@ def _row_to_goal(row: dict) -> dict:
         "delta": row.get("delta"),
         "assigned_by": row.get("assigned_by", "self"),
         "created_at": _iso(row.get("created_at")),
+        # Goal context (added in 0004)
+        "context_source_type": row.get("context_source_type"),
+        "context_url": row.get("context_url"),
+        "context_filename": row.get("context_filename"),
+        "context_mime": row.get("context_mime"),
+        "context_text": row.get("context_text"),
     }
 
 
@@ -373,8 +380,9 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                 """
                 INSERT INTO goals
                     (user_id, goal_id, name, objective, timeline, days_left,
-                     success_criteria, priority, status, readiness, delta, assigned_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     success_criteria, priority, status, readiness, delta, assigned_by,
+                     context_source_type, context_url, context_filename, context_mime, context_text)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (user_id, goal_id) DO UPDATE SET
                     name = EXCLUDED.name,
                     objective = EXCLUDED.objective,
@@ -385,7 +393,12 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                     status = EXCLUDED.status,
                     readiness = EXCLUDED.readiness,
                     delta = EXCLUDED.delta,
-                    assigned_by = EXCLUDED.assigned_by
+                    assigned_by = EXCLUDED.assigned_by,
+                    context_source_type = EXCLUDED.context_source_type,
+                    context_url = EXCLUDED.context_url,
+                    context_filename = EXCLUDED.context_filename,
+                    context_mime = EXCLUDED.context_mime,
+                    context_text = EXCLUDED.context_text
                 """,
                 (
                     user_id, goal_id, g.get("name", ""), g.get("objective"),
@@ -395,6 +408,11 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                     int(g.get("readiness") or 0),
                     g.get("delta"),
                     g.get("assigned_by", "self"),
+                    g.get("context_source_type"),
+                    g.get("context_url"),
+                    g.get("context_filename"),
+                    g.get("context_mime"),
+                    g.get("context_text"),
                 ),
             )
             cur.execute(
@@ -526,6 +544,12 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
         _persist_goal_path(user_id, goal_id)
         return {"goal_id": goal_id, "goal": user_data[goal_id]["goal"], "path": user_data[goal_id]["path"], "created": False}
 
+    # Optional context (URL / document / image / pasted text) attached at
+    # goal creation. The route handler in app.py runs goal_context.extract()
+    # and passes the extracted text on goal_input as context_text /
+    # context_source_type / context_url / context_filename / context_mime.
+    # When present, _generate_path_via_claude reads it and grounds the
+    # path in the actual JD/role description.
     goal = {
         "id": goal_id,
         "name": name,
@@ -538,6 +562,11 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
         "delta": goal_input.get("delta", "new"),
         "status": "active",
         "created_at": now,
+        "context_source_type": goal_input.get("context_source_type"),
+        "context_url": goal_input.get("context_url"),
+        "context_filename": goal_input.get("context_filename"),
+        "context_mime": goal_input.get("context_mime"),
+        "context_text": goal_input.get("context_text"),
     }
     path = {
         "id": f"path-{goal_id}",
@@ -672,13 +701,47 @@ def _generate_path_via_claude(goal: dict) -> list:
         "  - order: 1, 2, 3, ... incrementing\n"
         "No prose, no markdown fences."
     )
-    user_prompt = json.dumps({
+    # Pull in any context the learner attached at goal creation (JD URL,
+    # PDF, image of role description, etc.). When present, this is the
+    # most important grounding signal for the prompt — it turns "what
+    # does an SRE need to learn?" into "what does THIS SRE role at THIS
+    # company actually need?"
+    context_text = (goal.get("context_text") or "").strip()
+    context_source = (goal.get("context_source_type") or "").strip()
+    context_url = (goal.get("context_url") or "").strip()
+    context_filename = (goal.get("context_filename") or "").strip()
+
+    goal_payload = {
         "goal_name": goal.get("name"),
         "objective": goal.get("objective"),
         "success_criteria": goal.get("success_criteria"),
         "timeline": goal.get("timeline"),
         "priority": goal.get("priority"),
-    }, indent=2)
+    }
+
+    user_prompt_parts = [json.dumps(goal_payload, indent=2)]
+    if context_text:
+        provenance_bits = []
+        if context_source:
+            provenance_bits.append(f"source_type: {context_source}")
+        if context_url:
+            provenance_bits.append(f"url: {context_url}")
+        if context_filename:
+            provenance_bits.append(f"file: {context_filename}")
+        provenance = " · ".join(provenance_bits) if provenance_bits else "attached by learner"
+        user_prompt_parts.append(
+            "\n\n═══════════════════════════════════════════════\n"
+            f"ATTACHED CONTEXT ({provenance}):\n"
+            "Use this context as the PRIMARY signal for what the path should\n"
+            "cover. If it's a job posting, the steps should reflect the\n"
+            "specific tech / responsibilities / experience listed. If it's a\n"
+            "team brief or role description, ground the path in the team's\n"
+            "actual stack and priorities. Quote-back specific phrases from\n"
+            "this context in inserted_reason fields where relevant.\n"
+            "═══════════════════════════════════════════════\n\n"
+            f"{context_text}"
+        )
+    user_prompt = "".join(user_prompt_parts)
 
     response = claude_client._call_claude(
         system=system_prompt,

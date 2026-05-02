@@ -29,7 +29,7 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks, goal_context
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -1410,7 +1410,37 @@ def goal_create():
     goal_input = data.get("goal") or {}
     if not goal_input.get("name"):
         return jsonify({"error": "goal.name required"}), 400
-    return jsonify(path_engine.create_goal(user_id, goal_input))
+
+    # Optional context (URL / document / image / pasted text). When provided,
+    # goal_context.extract() runs the right extractor (Perplexity for URLs,
+    # Claude vision for images, Claude document for PDFs) and returns the
+    # text that the path-generation prompt will ground in. Failures here are
+    # NON-FATAL — we still create the goal, just without context. The frontend
+    # surfaces the error so the user knows.
+    context_payload = data.get("context") or {}
+    context_error = None
+    if any(context_payload.get(k) for k in ("url", "file_b64", "raw_text")):
+        text, source_type, err = goal_context.extract(
+            url=context_payload.get("url"),
+            file_b64=context_payload.get("file_b64"),
+            mime=context_payload.get("mime_type"),
+            filename=context_payload.get("filename"),
+            raw_text=context_payload.get("raw_text"),
+        )
+        if text:
+            goal_input["context_source_type"] = source_type
+            goal_input["context_url"] = (context_payload.get("url") or "").strip() or None
+            goal_input["context_filename"] = (context_payload.get("filename") or "").strip() or None
+            goal_input["context_mime"] = (context_payload.get("mime_type") or "").strip() or None
+            goal_input["context_text"] = text
+        if err:
+            context_error = err
+
+    response = path_engine.create_goal(user_id, goal_input)
+    if context_error:
+        # Surface to the frontend so the user knows context didn't attach
+        response["context_error"] = context_error
+    return jsonify(response)
 
 
 @app.route("/goal/archive", methods=["POST"])
