@@ -29,7 +29,8 @@ import json
 from datetime import datetime, timedelta
 
 # V3: deep-agentic + reasoning service modules
-from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks, goal_context, content_index
+from services import perplexity_client, claude_client, freshness, career, predigest, path_engine, sme, stay_ahead, career_simulator, resume, scheduler, calendar_client, notifications, embeddings, vector_index, content_classifier, drive_connector, work_items, team, rbac, audit_log, reports, skill_heatmap, onboarding, gigs, scim, schedule_blocks, goal_context
+from services import content_index as content_catalog  # module renamed to avoid collision with legacy in-memory `content_index = []` list (line ~446)
 from services.audit_log import audit_action, target_user, target_goal, target_path_step, target_resume_entry
 
 app = Flask(__name__)
@@ -2955,7 +2956,7 @@ def admin_content_csv_template():
     """Download a starter CSV template with header + 3 example rows."""
     if request.method == "POST" and not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
-    csv_text = content_index.get_template_csv()
+    csv_text = content_catalog.get_template_csv()
     return Response(
         csv_text,
         mimetype="text/csv",
@@ -2988,10 +2989,10 @@ def admin_content_import_csv():
     source_path = data.get("source_path")
     if source_path:
         # Disk-load is admin-only since it reads server-side files
-        return jsonify(content_index.load_seed(source_path, actor=actor))
+        return jsonify(content_catalog.load_seed(source_path, actor=actor))
     if not csv_text:
         return jsonify({"error": "csv_text or source_path required"}), 400
-    return jsonify(content_index.import_csv(csv_text, actor=actor))
+    return jsonify(content_catalog.import_csv(csv_text, actor=actor))
 
 
 @app.route("/admin/content/load_seed", methods=["POST"])
@@ -3003,7 +3004,7 @@ def admin_content_load_seed():
     if not rbac.has_any_permission(actor, "admin:users"):
         return jsonify({"error": "forbidden"}), 403
     seed_path = (request.json or {}).get("seed_path") or "seed_data/aasan_content_seed_v1.csv"
-    return jsonify(content_index.load_seed(seed_path, actor=actor))
+    return jsonify(content_catalog.load_seed(seed_path, actor=actor))
 
 
 @app.route("/admin/content/list", methods=["POST"])
@@ -3015,7 +3016,7 @@ def admin_content_list():
     if not verify_secret(request):
         return jsonify({"error": "Unauthorized"}), 401
     data = request.json or {}
-    return jsonify(content_index.list_for_browse(
+    return jsonify(content_catalog.list_for_browse(
         filters={
             "source": data.get("source"),
             "difficulty": data.get("difficulty"),
@@ -3042,7 +3043,7 @@ def admin_content_delete():
     cid = data.get("content_id")
     if cid is None:
         return jsonify({"error": "content_id required"}), 400
-    return jsonify(content_index.delete_one(cid))
+    return jsonify(content_catalog.delete_one(cid))
 
 
 @app.route("/admin/content/embed_pending", methods=["POST"])
@@ -3054,14 +3055,18 @@ def admin_content_embed_pending():
     if not rbac.has_any_permission(actor, "admin:users"):
         return jsonify({"error": "forbidden"}), 403
     data = request.json or {}
-    return jsonify(content_index.embed_pending(limit=int(data.get("limit") or 200)))
+    return jsonify(content_catalog.embed_pending(limit=int(data.get("limit") or 200)))
 
 
-@app.route("/content/search", methods=["POST"])
-def content_search():
+@app.route("/catalog/search", methods=["POST"])
+def catalog_search():
     """
     Learner-facing read-only search of the catalog. Used by LibraryCanvas
     and (eventually) by the Path Engine's RAG-augmented generation.
+
+    Path is /catalog/search (not /content/search) because the legacy
+    /content/search route already exists and operates on the in-memory
+    `content_index = []` list (Phase-1 scratch store).
 
     Body: { query?, source?, difficulty?, is_free?, content_type?,
             limit?, offset?, top_k?, mode? }
@@ -3073,7 +3078,7 @@ def content_search():
     data = request.json or {}
     mode = data.get("mode") or "browse"
     if mode == "retrieve":
-        results = content_index.retrieve(
+        results = content_catalog.retrieve(
             query_text=data.get("query") or "",
             top_k=int(data.get("top_k") or 30),
             filters={
@@ -3082,7 +3087,7 @@ def content_search():
             },
         )
         return jsonify({"items": results, "mode": "retrieve", "count": len(results)})
-    return jsonify(content_index.list_for_browse(
+    return jsonify(content_catalog.list_for_browse(
         filters={
             "source": data.get("source"),
             "difficulty": data.get("difficulty"),
