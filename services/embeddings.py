@@ -39,7 +39,7 @@ STUB_DIM = 512
 _VOYAGE_MODEL_DIMS = {
     "voyage-3": 1024,
     "voyage-3-lite": 512,
-    "voyage-3-large": 1536,
+    "voyage-3-large": 1024,   # default; supports 256/512/1024/2048 via output_dimension param (NOT 1536)
     "voyage-code-3": 1024,
     "voyage-finance-2": 1024,
     "voyage-law-2": 1024,
