@@ -27,5 +27,14 @@ google-auth>=2.20
 # Activates when PINECONE_API_KEY + PINECONE_INDEX env vars are set.
 pinecone>=5.0
 
+# Supabase Postgres — Tier 0 persistence (2026-05-01)
+# Activates when SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars are set.
+# Without env vars, services/db.py is a no-op and the services that have
+# in-memory fallbacks (path_engine, resume, work_items, audit_log, etc.) keep
+# working locally. The [binary] extra ships a prebuilt libpq so Render doesn't
+# need postgres-dev system packages.
+psycopg[binary]>=3.1
+psycopg-pool>=3.2
+
 # Production server (Render uses gunicorn)
 gunicorn>=21.0

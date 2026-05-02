@@ -30,18 +30,29 @@ Resume Module is the BRIDGE between "where you've been" (your record) and
 gives advice the learner can't actually act on (you can't apply without a
 resume, and a generic resume loses to a tailored one).
 
-PHASE 1 STORAGE
-───────────────
-In-memory dict keyed by user_id (mirrors content_index pattern). Phase 2
-migrates to Airtable Resume_Journal table.
+STORAGE
+───────
+Dual-mode: persists to Supabase Postgres table `journal_entries` when
+SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars are set. Falls back to an
+in-memory dict keyed by user_id when env vars are absent (local dev, demo
+mode). Schema in `migrations/0001_init.sql` (Table 26 in V2 Data Model).
+The in-memory `_FEED` (peer notification queue) stays in-process for now —
+it's transient and not part of Tier 0 persistence scope.
 """
 
+import json
+import logging
 from datetime import datetime
-from . import perplexity_client, claude_client
+from . import perplexity_client, claude_client, db
+
+logger = logging.getLogger(__name__)
 
 
-# In-memory store: { user_id: [entry, entry, ...] }
+# In-memory fallback store: { user_id: [entry, entry, ...] }
+# When db.is_enabled(), the Postgres `journal_entries` table is the source of truth;
+# this dict is used for local dev / Postgres-down fallback only.
 _JOURNAL = {}
+_DEMO_SEEDED_USERS_PG: set[str] = set()  # tracks which users have been demo-seeded into Postgres
 
 
 # ──────────────────────────────────────────────────────────────
@@ -140,10 +151,169 @@ DEMO_ENTRIES = [
 ]
 
 
-def _ensure_user(user_id: str):
+def _ensure_user(user_id: str) -> list[dict]:
+    """
+    Return the journal list for a user. When Postgres is enabled, reads fresh
+    from the `journal_entries` table on every call so the social mutations
+    (endorsements / share) made in earlier requests are visible. When disabled,
+    uses _JOURNAL as an in-process cache. demo-user gets the DEMO_ENTRIES seed
+    on first access either way.
+    """
+    if db.is_enabled():
+        if user_id == "demo-user" and user_id not in _DEMO_SEEDED_USERS_PG:
+            _maybe_seed_demo_user_pg()
+            _DEMO_SEEDED_USERS_PG.add(user_id)
+        try:
+            entries = _load_user_journal_pg(user_id)
+            _JOURNAL[user_id] = entries  # buffer for in-request mutations
+            return entries
+        except Exception as exc:
+            logger.warning("journal PG load failed (%s) — falling back to in-memory", exc)
+
     if user_id not in _JOURNAL:
-        _JOURNAL[user_id] = list(DEMO_ENTRIES)  # seed demo entries on first access
+        if user_id == "demo-user":
+            _JOURNAL[user_id] = list(DEMO_ENTRIES)
+        else:
+            _JOURNAL[user_id] = []
     return _JOURNAL[user_id]
+
+
+def _maybe_seed_demo_user_pg():
+    """If demo-user has no journal entries in Postgres, write the demo seed."""
+    try:
+        existing = db.query_one(
+            "SELECT COUNT(*) AS n FROM journal_entries WHERE user_id = %s",
+            ("demo-user",),
+        )
+        if existing and int(existing.get("n", 0)) > 0:
+            return
+        for entry in DEMO_ENTRIES:
+            _upsert_entry_pg("demo-user", entry)
+        logger.info("Seeded %d demo journal entries for demo-user", len(DEMO_ENTRIES))
+    except Exception as exc:
+        logger.warning("demo-user journal seed failed (%s)", exc)
+
+
+def _load_user_journal_pg(user_id: str) -> list[dict]:
+    """Read all journal entries for a user from Postgres, newest first by date."""
+    rows = db.query(
+        """
+        SELECT entry_id, entry_external_id, entry_date, title, category,
+               description, outcomes, technologies, stakeholders,
+               transferable_skills, raw_input, company, project, author_id,
+               endorsements, shared_with, captured_at, updated_at
+        FROM journal_entries
+        WHERE user_id = %s
+        ORDER BY entry_date DESC, captured_at DESC
+        """,
+        (user_id,),
+    ) or []
+    return [_row_to_entry(r) for r in rows]
+
+
+def _row_to_entry(row: dict) -> dict:
+    """Normalize a journal_entries row to the entry dict shape used by callers."""
+    return {
+        "entry_id": row.get("entry_external_id") or f"j-{row.get('entry_id')}",
+        "date": row["entry_date"].isoformat() if hasattr(row.get("entry_date"), "isoformat") else row.get("entry_date"),
+        "title": row.get("title", ""),
+        "category": row.get("category", "project"),
+        "description": row.get("description", ""),
+        "outcomes": _coerce_json_list(row.get("outcomes")),
+        "technologies": list(row.get("technologies") or []),
+        "stakeholders": _coerce_json_list(row.get("stakeholders")),
+        "transferable_skills": list(row.get("transferable_skills") or []),
+        "raw_input": row.get("raw_input"),
+        "company": row.get("company") or "",
+        "project": row.get("project") or "",
+        "author_id": row.get("author_id"),
+        "endorsements": _coerce_json_list(row.get("endorsements")),
+        "shared_with": _coerce_json_list(row.get("shared_with")),
+        "captured_at": row["captured_at"].isoformat() if hasattr(row.get("captured_at"), "isoformat") else row.get("captured_at"),
+    }
+
+
+def _coerce_json_list(v) -> list:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json.loads(v)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+    return list(v) if hasattr(v, "__iter__") else []
+
+
+def _upsert_entry_pg(user_id: str, entry: dict) -> dict | None:
+    """Insert-or-update a single journal entry. Returns the persisted row."""
+    if not db.is_enabled():
+        return None
+    try:
+        row = db.execute_returning(
+            """
+            INSERT INTO journal_entries
+                (user_id, entry_external_id, entry_date, title, category,
+                 description, outcomes, technologies, stakeholders,
+                 transferable_skills, raw_input, company, project, author_id,
+                 endorsements, shared_with, captured_at)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
+            ON CONFLICT (user_id, entry_external_id) DO UPDATE SET
+                entry_date = EXCLUDED.entry_date,
+                title = EXCLUDED.title,
+                category = EXCLUDED.category,
+                description = EXCLUDED.description,
+                outcomes = EXCLUDED.outcomes,
+                technologies = EXCLUDED.technologies,
+                stakeholders = EXCLUDED.stakeholders,
+                transferable_skills = EXCLUDED.transferable_skills,
+                raw_input = EXCLUDED.raw_input,
+                company = EXCLUDED.company,
+                project = EXCLUDED.project,
+                author_id = EXCLUDED.author_id,
+                endorsements = EXCLUDED.endorsements,
+                shared_with = EXCLUDED.shared_with
+            RETURNING entry_id, entry_external_id, entry_date, title, category,
+                      description, outcomes, technologies, stakeholders,
+                      transferable_skills, raw_input, company, project, author_id,
+                      endorsements, shared_with, captured_at, updated_at
+            """,
+            (
+                user_id,
+                entry.get("entry_id"),  # legacy id → entry_external_id
+                entry.get("date") or datetime.utcnow().date().isoformat(),
+                entry.get("title", ""),
+                entry.get("category", "project"),
+                entry.get("description", ""),
+                json.dumps(list(entry.get("outcomes") or [])),
+                list(entry.get("technologies") or []),
+                json.dumps(list(entry.get("stakeholders") or [])),
+                list(entry.get("transferable_skills") or []),
+                entry.get("raw_input"),
+                entry.get("company") or "",
+                entry.get("project") or "",
+                entry.get("author_id") or user_id,
+                json.dumps(list(entry.get("endorsements") or [])),
+                json.dumps(list(entry.get("shared_with") or [])),
+                entry.get("captured_at") or datetime.utcnow().isoformat(),
+            ),
+        )
+        return row
+    except Exception as exc:
+        logger.warning("journal upsert failed for %s/%s (%s)", user_id, entry.get("entry_id"), exc)
+        return None
+
+
+def _persist_entry(user_id: str, entry: dict) -> None:
+    """
+    Persist a single entry's current state to Postgres. Called after every
+    social mutation (endorsement add/decline, share). No-op when fallback.
+    """
+    if db.is_enabled():
+        _upsert_entry_pg(user_id, entry)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -192,12 +362,14 @@ def add_entry(user_id: str, raw_input: str = "", structured: dict = None) -> dic
     entry["shared_with"] = []
 
     # Apply share + endorsement requests, generating feed events as side effects
+    # (these mutate `entry["shared_with"]` / `entry["endorsements"]` in place)
     if peers_share:
         share_entry(user_id, entry["entry_id"], peers_share, _entry_ref=entry, _suppress_journal_lookup=True)
     if peers_endorse:
         request_endorsements(user_id, entry["entry_id"], peers_endorse, _entry_ref=entry, _suppress_journal_lookup=True)
 
     journal.append(entry)
+    _persist_entry(user_id, entry)
     return {
         "entry": entry,
         "journal_size": len(journal),
@@ -258,6 +430,10 @@ def share_entry(user_id: str, entry_id: str, peer_emails: list, _entry_ref=None,
             "entry_project": entry.get("project"),
             "entry_outcomes": (entry.get("outcomes") or [])[:2],
         })
+    # Persist the new shared_with state (no-op when fallback or when called
+    # via add_entry, which persists once at the end).
+    if not _suppress_journal_lookup:
+        _persist_entry(user_id, entry)
     return {"ok": True, "shared_with": entry["shared_with"], "count": len(entry["shared_with"])}
 
 
@@ -295,6 +471,8 @@ def request_endorsements(user_id: str, entry_id: str, peer_emails: list, _entry_
             "entry_project": entry.get("project"),
             "entry_outcomes": (entry.get("outcomes") or [])[:2],
         })
+    if not _suppress_journal_lookup:
+        _persist_entry(user_id, entry)
     return {"ok": True, "endorsements": entry["endorsements"]}
 
 
@@ -325,6 +503,7 @@ def decline_endorsement(author_user_id: str, entry_id: str, endorser_email: str,
         "entry_title": entry.get("title"),
         "reason": reason,
     })
+    _persist_entry(author_user_id, entry)
     return {"ok": True, "entry_id": entry_id, "endorsement": existing}
 
 
@@ -373,6 +552,7 @@ def endorse_entry(author_user_id: str, entry_id: str, endorser_email: str,
         "entry_title": entry.get("title"),
         "comment": comment,
     })
+    _persist_entry(author_user_id, entry)
     return {"ok": True, "entry_id": entry_id, "endorsement": existing or entry["endorsements"][-1]}
 
 

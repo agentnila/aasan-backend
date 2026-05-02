@@ -12,11 +12,13 @@ in response to:
 Each adjustment writes a diff back to the path AND a one-line entry to
 recompute_history (visible to the learner — full transparency).
 
-PHASE 1 STORAGE
-───────────────
-In-memory dict keyed by user_id (mirrors content_index). Phase 2 migrates
-to Airtable Tables 16 (Learning_Paths) + 17 (Path_Steps). The data shape
-defined here matches the target schema.
+STORAGE
+───────
+Dual-mode: persists to Supabase Postgres tables `goals`, `paths`, `path_steps`,
+`path_recomputes` when SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars are set.
+Falls back to an in-memory dict keyed by user_id when env vars are absent
+(local dev, demo mode). The data shape defined here matches the Postgres
+schema in `migrations/0001_init.sql`.
 
 CLAUDE MODE
 ───────────
@@ -25,8 +27,12 @@ When ANTHROPIC_API_KEY is set, the engine prompts Claude Sonnet over
 When unset, returns deterministic stub diffs that demonstrate the loop.
 """
 
+import json
+import logging
 from datetime import datetime
-from . import claude_client
+from . import claude_client, db
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -145,24 +151,340 @@ def _seed_paths():
     }
 
 
-# In-memory store: { user_id: { goal_id: { goal: {...}, path: {...} } } }
+# In-memory fallback store: { user_id: { goal_id: { goal: {...}, path: {...} } } }
+# Used when SUPABASE_URL is unset (local dev / demo without DB) and as a
+# per-process working buffer between read and write within a single request.
 _STORE = {}
 
+# Tracks which users have had demo-user seeded into Postgres this process
+_DEMO_SEEDED_USERS_PG: set[str] = set()
+
 # Manager-assigned content waiting to be applied — flushed by recompute.
+# Always in-memory (transient queue, not persisted).
 _ASSIGNMENT_QUEUE = {}  # { user_id: [{title, source, url, assigned_by, ...}, ...] }
 
 
 def _ensure_user(user_id: str):
     """
-    Demo-user gets the 3-goal seed for the canned product story.
-    Everyone else starts empty — goals come from /goal/create.
+    Return the user's goal/path data as { goal_id: { goal, path } }.
+
+    When db.is_enabled(), reads fresh from Postgres on every call (no inter-
+    request caching — the per-request mutation flow is read → mutate → persist).
+    The Postgres read populates _STORE so within the same call mutations are
+    visible without round-tripping.
+
+    When Postgres isn't configured, uses _STORE as the persistent in-process
+    cache. demo-user gets the 3-goal seed on first access.
     """
+    if db.is_enabled():
+        if user_id == "demo-user" and user_id not in _DEMO_SEEDED_USERS_PG:
+            _maybe_seed_demo_user_pg()
+            _DEMO_SEEDED_USERS_PG.add(user_id)
+        try:
+            user_data = _load_user_from_pg(user_id)
+            _STORE[user_id] = user_data  # so subsequent _persist_* sees the buffer
+            return user_data
+        except Exception as exc:
+            logger.warning("path_engine PG load failed (%s) — falling back to in-memory", exc)
+
     if user_id not in _STORE:
         if user_id == "demo-user":
             _STORE[user_id] = _seed_paths()
         else:
             _STORE[user_id] = {}
     return _STORE[user_id]
+
+
+# ──────────────────────────────────────────────────────────────
+# Postgres I/O helpers
+# ──────────────────────────────────────────────────────────────
+
+def _maybe_seed_demo_user_pg():
+    """If demo-user has no goals in Postgres, write the demo seed."""
+    try:
+        existing = db.query_one(
+            "SELECT COUNT(*) AS n FROM goals WHERE user_id = %s",
+            ("demo-user",),
+        )
+        if existing and int(existing.get("n", 0)) > 0:
+            return
+        seed = _seed_paths()
+        for goal_id, entry in seed.items():
+            _STORE.setdefault("demo-user", {})[goal_id] = entry
+            _persist_goal_path("demo-user", goal_id)
+            for hist_entry in reversed(entry["path"].get("recompute_history") or []):
+                _persist_recompute_pg("demo-user", goal_id, hist_entry, trigger="seed")
+        logger.info("Seeded demo-user with %d goals into Postgres", len(seed))
+    except Exception as exc:
+        logger.warning("demo-user PG seed failed (%s)", exc)
+
+
+def _load_user_from_pg(user_id: str) -> dict:
+    """Reconstruct the { goal_id: { goal, path } } shape from Postgres."""
+    goal_rows = db.query(
+        """
+        SELECT goal_id, name, objective, timeline, days_left, success_criteria,
+               priority, status, readiness, delta, assigned_by, created_at, updated_at
+        FROM goals
+        WHERE user_id = %s
+        ORDER BY created_at
+        """,
+        (user_id,),
+    ) or []
+    user_data: dict = {}
+    for g in goal_rows:
+        goal_id = g["goal_id"]
+        path_row = db.query_one(
+            """
+            SELECT path_id, title, progress_pct, current_step_id,
+                   estimated_total_minutes, last_recompute_reason,
+                   last_recomputed_at, status, created_at
+            FROM paths
+            WHERE user_id = %s AND goal_id = %s
+            """,
+            (user_id, goal_id),
+        )
+        step_rows = db.query(
+            """
+            SELECT step_id, step_order, title, step_type, status,
+                   estimated_minutes, actual_minutes, mastery_at_completion,
+                   inserted_by, inserted_reason, completed_at, inserted_at
+            FROM path_steps
+            WHERE user_id = %s AND goal_id = %s
+            ORDER BY step_order
+            """,
+            (user_id, goal_id),
+        ) or []
+        history_rows = db.query(
+            """
+            SELECT recomputed_at, trigger, reason, diff
+            FROM path_recomputes
+            WHERE user_id = %s AND goal_id = %s
+            ORDER BY recomputed_at DESC
+            LIMIT 10
+            """,
+            (user_id, goal_id),
+        ) or []
+
+        user_data[goal_id] = {
+            "goal": _row_to_goal(g),
+            "path": _rows_to_path(path_row, step_rows, history_rows, goal_id),
+        }
+    return user_data
+
+
+def _row_to_goal(row: dict) -> dict:
+    return {
+        "id": row["goal_id"],
+        "name": row.get("name", ""),
+        "objective": row.get("objective"),
+        "timeline": row.get("timeline"),
+        "days_left": row.get("days_left"),
+        "success_criteria": row.get("success_criteria"),
+        "priority": row.get("priority", "secondary"),
+        "status": row.get("status", "active"),
+        "readiness": int(row.get("readiness") or 0),
+        "delta": row.get("delta"),
+        "assigned_by": row.get("assigned_by", "self"),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+def _rows_to_path(path_row, step_rows, history_rows, goal_id: str) -> dict:
+    if not path_row:
+        return {
+            "id": f"path-{goal_id}",
+            "title": "",
+            "progress_pct": 0,
+            "current_step_id": None,
+            "estimated_total_minutes": 0,
+            "last_recompute_reason": "",
+            "last_recomputed_at": None,
+            "recompute_history": [],
+            "steps": [],
+        }
+    return {
+        "id": path_row.get("path_id") or f"path-{goal_id}",
+        "title": path_row.get("title", ""),
+        "progress_pct": int(path_row.get("progress_pct") or 0),
+        "current_step_id": path_row.get("current_step_id"),
+        "estimated_total_minutes": int(path_row.get("estimated_total_minutes") or 0),
+        "last_recompute_reason": path_row.get("last_recompute_reason"),
+        "last_recomputed_at": _iso(path_row.get("last_recomputed_at")),
+        "recompute_history": [
+            {
+                "date": _iso(h["recomputed_at"])[:10] if h.get("recomputed_at") else "",
+                "trigger": h.get("trigger"),
+                "reason": h.get("reason"),
+                **(h.get("diff") if isinstance(h.get("diff"), dict) else {}),
+            }
+            for h in history_rows
+        ],
+        "steps": [_row_to_step(s) for s in step_rows],
+    }
+
+
+def _row_to_step(row: dict) -> dict:
+    out = {
+        "id": row["step_id"],
+        "order": float(row["step_order"]) if row.get("step_order") is not None else 0,
+        "title": row.get("title", ""),
+        "step_type": row.get("step_type", "content"),
+        "status": row.get("status", "pending"),
+    }
+    for opt in ("estimated_minutes", "actual_minutes", "mastery_at_completion",
+                "inserted_by", "inserted_reason"):
+        v = row.get(opt)
+        if v is not None:
+            out[opt] = float(v) if opt == "mastery_at_completion" else v
+    if row.get("completed_at"):
+        out["completed_at"] = _iso(row["completed_at"])[:10]
+    return out
+
+
+def _iso(v):
+    if v is None:
+        return None
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v)
+
+
+def _persist_goal_path(user_id: str, goal_id: str) -> None:
+    """
+    Upsert goal + path + delete-and-replace path_steps for this goal.
+    No-op when Postgres isn't configured (fallback uses _STORE in place).
+    """
+    if not db.is_enabled():
+        return
+    entry = _STORE.get(user_id, {}).get(goal_id)
+    if not entry:
+        return
+    g = entry["goal"]
+    p = entry["path"]
+
+    try:
+        with db.transaction() as cur:
+            if cur is None:
+                return
+            cur.execute(
+                """
+                INSERT INTO goals
+                    (user_id, goal_id, name, objective, timeline, days_left,
+                     success_criteria, priority, status, readiness, delta, assigned_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, goal_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    objective = EXCLUDED.objective,
+                    timeline = EXCLUDED.timeline,
+                    days_left = EXCLUDED.days_left,
+                    success_criteria = EXCLUDED.success_criteria,
+                    priority = EXCLUDED.priority,
+                    status = EXCLUDED.status,
+                    readiness = EXCLUDED.readiness,
+                    delta = EXCLUDED.delta,
+                    assigned_by = EXCLUDED.assigned_by
+                """,
+                (
+                    user_id, goal_id, g.get("name", ""), g.get("objective"),
+                    g.get("timeline"), g.get("days_left"), g.get("success_criteria"),
+                    g.get("priority", "secondary"),
+                    _coerce_status(g.get("status", "active")),
+                    int(g.get("readiness") or 0),
+                    g.get("delta"),
+                    g.get("assigned_by", "self"),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO paths
+                    (user_id, goal_id, path_id, title, progress_pct, current_step_id,
+                     estimated_total_minutes, last_recompute_reason,
+                     last_recomputed_at, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, goal_id) DO UPDATE SET
+                    path_id = EXCLUDED.path_id,
+                    title = EXCLUDED.title,
+                    progress_pct = EXCLUDED.progress_pct,
+                    current_step_id = EXCLUDED.current_step_id,
+                    estimated_total_minutes = EXCLUDED.estimated_total_minutes,
+                    last_recompute_reason = EXCLUDED.last_recompute_reason,
+                    last_recomputed_at = EXCLUDED.last_recomputed_at,
+                    status = EXCLUDED.status
+                """,
+                (
+                    user_id, goal_id, p.get("id") or f"path-{goal_id}",
+                    p.get("title", ""), int(p.get("progress_pct") or 0),
+                    p.get("current_step_id"),
+                    int(p.get("estimated_total_minutes") or 0),
+                    p.get("last_recompute_reason"),
+                    p.get("last_recomputed_at"),
+                    "active",
+                ),
+            )
+            cur.execute(
+                "DELETE FROM path_steps WHERE user_id = %s AND goal_id = %s",
+                (user_id, goal_id),
+            )
+            for step in p.get("steps", []):
+                cur.execute(
+                    """
+                    INSERT INTO path_steps
+                        (user_id, goal_id, step_id, step_order, title, step_type,
+                         status, estimated_minutes, actual_minutes,
+                         mastery_at_completion, inserted_by, inserted_reason,
+                         completed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id, goal_id, step["id"],
+                        float(step.get("order") or 0),
+                        step.get("title", ""),
+                        step.get("step_type", "content"),
+                        step.get("status", "pending"),
+                        step.get("estimated_minutes"),
+                        step.get("actual_minutes"),
+                        step.get("mastery_at_completion"),
+                        step.get("inserted_by", "engine"),
+                        step.get("inserted_reason"),
+                        step.get("completed_at"),
+                    ),
+                )
+    except Exception as exc:
+        logger.warning("path_engine persist failed for %s/%s (%s)", user_id, goal_id, exc)
+
+
+def _persist_recompute_pg(user_id: str, goal_id: str, history_entry: dict,
+                           trigger: str | None = None) -> None:
+    """Append a single row to path_recomputes (the normalized history table)."""
+    if not db.is_enabled():
+        return
+    try:
+        diff = {k: v for k, v in history_entry.items()
+                if k not in ("date", "trigger", "reason")}
+        db.execute(
+            """
+            INSERT INTO path_recomputes (user_id, goal_id, trigger, reason, diff)
+            VALUES (%s, %s, %s, %s, %s::jsonb)
+            """,
+            (
+                user_id, goal_id,
+                trigger or history_entry.get("trigger") or "unknown",
+                history_entry.get("reason"),
+                json.dumps(diff),
+            ),
+        )
+    except Exception as exc:
+        logger.warning("path_recompute insert failed (%s)", exc)
+
+
+def _coerce_status(status: str) -> str:
+    """Normalize legacy status values to the constraint-allowed set."""
+    if status in ("active", "achieved", "paused", "abandoned", "archived"):
+        return status
+    if status == "completed":
+        return "achieved"
+    return "active"
 
 
 def _slugify(name: str) -> str:
@@ -194,6 +516,7 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
     if goal_id in user_data:
         # Update existing
         user_data[goal_id]["goal"].update({k: v for k, v in goal_input.items() if k != "id"})
+        _persist_goal_path(user_id, goal_id)
         return {"goal_id": goal_id, "goal": user_data[goal_id]["goal"], "path": user_data[goal_id]["path"], "created": False}
 
     goal = {
@@ -221,6 +544,7 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
         "steps": [],
     }
     user_data[goal_id] = {"goal": goal, "path": path}
+    _persist_goal_path(user_id, goal_id)
     return {"goal_id": goal_id, "goal": goal, "path": path, "created": True}
 
 
@@ -230,6 +554,7 @@ def archive_goal(user_id: str, goal_id: str) -> dict:
         return {"error": f"goal {goal_id} not found"}
     user_data[goal_id]["goal"]["status"] = "archived"
     user_data[goal_id]["goal"]["archived_at"] = datetime.utcnow().isoformat()
+    _persist_goal_path(user_id, goal_id)
     return {"goal_id": goal_id, "status": "archived"}
 
 
@@ -244,6 +569,7 @@ def update_goal_progress(user_id: str, goal_id: str, readiness: int = None, delt
         g["delta"] = delta or (f"+{g['readiness'] - prev} this update" if g['readiness'] != prev else "no change")
     elif delta:
         g["delta"] = delta
+    _persist_goal_path(user_id, goal_id)
     return {"goal_id": goal_id, "goal": g}
 
 
@@ -385,19 +711,24 @@ def recompute(user_id: str, goal_id: str, trigger: str, trigger_payload: dict = 
     path["last_recompute_reason"] = diff.get("summary", f"recompute: {trigger}")
 
     # 4. Append to history (most recent first)
-    path["recompute_history"].insert(0, {
+    history_entry = {
         "date": now[:10],
         "trigger": trigger,
         "reason": diff.get("summary", ""),
         "added": [s.get("title") for s in diff.get("added", [])],
         "modified_count": len(diff.get("modified", [])),
-    })
+    }
+    path["recompute_history"].insert(0, history_entry)
     path["recompute_history"] = path["recompute_history"][:10]  # cap log
 
     # 5. Recompute progress + current step
     _recompute_progress(path)
 
-    # 6. Bounded-change rule — flag diffs that touch >30% of pending steps
+    # 6. Persist back to Postgres (no-op when fallback)
+    _persist_goal_path(user_id, goal_id)
+    _persist_recompute_pg(user_id, goal_id, history_entry, trigger=trigger)
+
+    # 7. Bounded-change rule — flag diffs that touch >30% of pending steps
     pending_count = max(1, sum(1 for s in path["steps"] if s["status"] == "pending"))
     touched = (
         len(diff.get("added", []) or [])
@@ -470,6 +801,7 @@ def mark_step_done(user_id: str, goal_id: str, step_id: str, mastery: float = No
     if duration_minutes is not None:
         step["actual_minutes"] = int(duration_minutes)
     _recompute_progress(path)
+    _persist_goal_path(user_id, goal_id)
     return {"goal_id": goal_id, "step_id": step_id, "status": "done", "progress_pct": path["progress_pct"]}
 
 
@@ -486,13 +818,16 @@ def skip_step(user_id: str, goal_id: str, step_id: str, reason: str = "") -> dic
     step["skipped_reason"] = reason
     step["skipped_at"] = datetime.utcnow().isoformat()
     _recompute_progress(path)
-    path["recompute_history"].insert(0, {
+    history_entry = {
         "date": datetime.utcnow().isoformat()[:10],
         "trigger": "learner_edit",
         "reason": f"Learner skipped: {step.get('title')}" + (f" ({reason})" if reason else ""),
         "added": [],
         "modified_count": 1,
-    })
+    }
+    path["recompute_history"].insert(0, history_entry)
+    _persist_goal_path(user_id, goal_id)
+    _persist_recompute_pg(user_id, goal_id, history_entry, trigger="learner_edit")
     return {"goal_id": goal_id, "step_id": step_id, "status": "skipped"}
 
 
@@ -507,13 +842,16 @@ def reorder_step(user_id: str, goal_id: str, step_id: str, new_order: float) -> 
     step["order"] = float(new_order)
     step["inserted_by"] = "learner"  # learner-touched → sacred
     path["steps"].sort(key=lambda s: s.get("order", 999))
-    path["recompute_history"].insert(0, {
+    history_entry = {
         "date": datetime.utcnow().isoformat()[:10],
         "trigger": "learner_edit",
         "reason": f"Learner reordered: {step.get('title')} → position {new_order}",
         "added": [],
         "modified_count": 1,
-    })
+    }
+    path["recompute_history"].insert(0, history_entry)
+    _persist_goal_path(user_id, goal_id)
+    _persist_recompute_pg(user_id, goal_id, history_entry, trigger="learner_edit")
     return {"goal_id": goal_id, "step_id": step_id, "new_order": new_order}
 
 
@@ -535,13 +873,16 @@ def insert_step_manual(user_id: str, goal_id: str, step: dict) -> dict:
     }
     path["steps"].append(new_step)
     path["steps"].sort(key=lambda s: s.get("order", 999))
-    path["recompute_history"].insert(0, {
+    history_entry = {
         "date": datetime.utcnow().isoformat()[:10],
         "trigger": "learner_edit",
         "reason": f"Learner inserted: {new_step.get('title')}",
         "added": [new_step.get("title")],
         "modified_count": 0,
-    })
+    }
+    path["recompute_history"].insert(0, history_entry)
+    _persist_goal_path(user_id, goal_id)
+    _persist_recompute_pg(user_id, goal_id, history_entry, trigger="learner_edit")
     return {"step": new_step, "path_steps_count": len(path["steps"])}
 
 

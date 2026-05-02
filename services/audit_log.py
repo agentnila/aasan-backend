@@ -2,10 +2,17 @@
 Audit log — Internal Pilot Pack · Phase C.
 
 Immutable record of who did what, when. Wraps state-changing endpoints
-via the @audit decorator. Phase 1 storage: in-memory `_LOG` list ordered
-oldest → newest. Phase 2: Postgres-backed (append-only, no UPDATE/DELETE)
-once we have a real DB. Foundation for SOC 2 even though we're not in
+via the @audit decorator. Foundation for SOC 2 even though we're not in
 formal audit yet.
+
+STORAGE
+───────
+Dual-mode (Tier 0, 2026-05-01):
+  - When SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars are set, every
+    record() writes to the Postgres `audit_log` table. query() reads from it.
+  - When env vars are absent, the in-memory `_LOG` list is the source of
+    truth. Lossy on Render restart but fine for local dev / demo.
+The Postgres path is append-only — no UPDATE or DELETE happens from app code.
 
 ENTRY SHAPE
 ───────────
@@ -34,9 +41,15 @@ DESIGN NOTES
 
 import csv
 import io
+import json
+import logging
 import re
 from datetime import datetime
 from functools import wraps
+
+from . import db
+
+logger = logging.getLogger(__name__)
 
 
 _LOG = []
@@ -45,8 +58,10 @@ _SEQ = [0]
 
 def record(actor_user_id: str, action: str, target: str = None, details: dict = None,
            actor_role: str = None, request_id: str = None) -> dict:
-    """Append an audit entry. Idempotent on (actor, action, target, ms-bucket)
-    is NOT enforced — duplicate calls produce duplicate rows by design."""
+    """Append an audit entry. Writes through to Postgres when configured;
+    always also appends to in-memory _LOG so the same-process query path
+    sees the entry without a round-trip. Idempotency is NOT enforced —
+    duplicate calls produce duplicate rows by design."""
     _SEQ[0] += 1
     ts = datetime.utcnow()
     entry = {
@@ -59,6 +74,32 @@ def record(actor_user_id: str, action: str, target: str = None, details: dict = 
         "details": details or {},
         "request_id": request_id,
     }
+
+    # Write through to Postgres (best effort — never block on audit failures)
+    if db.is_enabled():
+        try:
+            db.execute(
+                """
+                INSERT INTO audit_log
+                    (audit_id, occurred_at, actor_user_id, actor_role,
+                     action, target, details, request_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (audit_id) DO NOTHING
+                """,
+                (
+                    entry["audit_id"],
+                    ts,
+                    entry["actor_user_id"],
+                    entry["actor_role"],
+                    entry["action"],
+                    entry["target"],
+                    json.dumps(entry["details"]),
+                    entry["request_id"],
+                ),
+            )
+        except Exception as exc:
+            logger.warning("audit_log write to Postgres failed (%s) — recorded in memory only", exc)
+
     _LOG.append(entry)
     return entry
 
@@ -70,7 +111,23 @@ def record(actor_user_id: str, action: str, target: str = None, details: dict = 
 def query(filter_actor: str = None, filter_action: str = None, filter_target: str = None,
           since: str = None, until: str = None, search: str = None,
           limit: int = 200) -> dict:
-    """Newest-first; filters AND-combined."""
+    """Newest-first; filters AND-combined.
+
+    When Postgres is configured, reads from the `audit_log` table directly
+    (filters pushed into SQL where possible). Otherwise filters in-memory
+    `_LOG`. Aggregate stats (by_action / by_actor) come from the full log,
+    not the filtered subset, so callers see total volume even when scoped.
+    """
+    if db.is_enabled():
+        try:
+            return _query_pg(
+                filter_actor=filter_actor, filter_action=filter_action,
+                filter_target=filter_target, since=since, until=until,
+                search=search, limit=limit,
+            )
+        except Exception as exc:
+            logger.warning("audit_log query from Postgres failed (%s) — falling back to in-memory", exc)
+
     out = list(reversed(_LOG))
 
     if filter_actor:
@@ -117,6 +174,120 @@ def query(filter_actor: str = None, filter_action: str = None, filter_target: st
         "total": len(_LOG),
         "by_action": dict(sorted(actions.items(), key=lambda kv: -kv[1])[:20]),
         "by_actor":  dict(sorted(actors.items(),  key=lambda kv: -kv[1])[:20]),
+    }
+
+
+def _query_pg(filter_actor=None, filter_action=None, filter_target=None,
+              since=None, until=None, search=None, limit=200) -> dict:
+    """Postgres-backed implementation of query()."""
+    clauses: list[str] = []
+    params: list = []
+
+    if filter_actor:
+        clauses.append("LOWER(actor_user_id) LIKE %s")
+        params.append(f"%{filter_actor.lower()}%")
+
+    if filter_action:
+        if filter_action.endswith("*"):
+            clauses.append("action LIKE %s")
+            params.append(f"{filter_action[:-1]}%")
+        else:
+            clauses.append("action = %s")
+            params.append(filter_action)
+
+    if filter_target:
+        clauses.append("LOWER(target) LIKE %s")
+        params.append(f"%{filter_target.lower()}%")
+
+    if since:
+        clauses.append("occurred_at >= %s")
+        params.append(since)
+    if until:
+        clauses.append("occurred_at <= %s")
+        params.append(until)
+
+    if search:
+        clauses.append(
+            "(LOWER(actor_user_id) LIKE %s "
+            "OR LOWER(action) LIKE %s "
+            "OR LOWER(COALESCE(target, '')) LIKE %s "
+            "OR LOWER(details::text) LIKE %s)"
+        )
+        s = f"%{search.lower()}%"
+        params.extend([s, s, s, s])
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    params.append(int(limit))
+    rows = db.query(
+        f"""
+        SELECT audit_id, occurred_at, actor_user_id, actor_role,
+               action, target, details, request_id
+        FROM audit_log
+        {where}
+        ORDER BY occurred_at DESC
+        LIMIT %s
+        """,
+        params,
+    ) or []
+
+    entries = [_pg_row_to_entry(r) for r in rows]
+
+    # filtered_count needs the COUNT(*) for the same WHERE
+    if clauses:
+        count_row = db.query_one(
+            f"SELECT COUNT(*) AS n FROM audit_log {where}",
+            params[:-1],  # drop the LIMIT param
+        )
+        filtered_count = int(count_row["n"]) if count_row else len(entries)
+    else:
+        filtered_count = len(entries)
+
+    total_row = db.query_one("SELECT COUNT(*) AS n FROM audit_log")
+    total = int(total_row["n"]) if total_row else 0
+
+    by_action = {
+        r["action"]: int(r["n"])
+        for r in (db.query(
+            "SELECT action, COUNT(*) AS n FROM audit_log GROUP BY action ORDER BY n DESC LIMIT 20"
+        ) or [])
+    }
+    by_actor = {
+        r["actor_user_id"]: int(r["n"])
+        for r in (db.query(
+            "SELECT actor_user_id, COUNT(*) AS n FROM audit_log GROUP BY actor_user_id ORDER BY n DESC LIMIT 20"
+        ) or [])
+    }
+
+    return {
+        "entries": entries,
+        "filtered_count": filtered_count,
+        "total": total,
+        "by_action": by_action,
+        "by_actor": by_actor,
+    }
+
+
+def _pg_row_to_entry(row: dict) -> dict:
+    """Normalize a Postgres audit_log row to the in-memory entry shape."""
+    occurred = row.get("occurred_at")
+    ts = occurred.isoformat() if hasattr(occurred, "isoformat") else (occurred or "")
+    details = row.get("details")
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except (ValueError, TypeError):
+            details = {}
+    elif details is None:
+        details = {}
+    return {
+        "audit_id": row.get("audit_id"),
+        "timestamp": ts,
+        "actor_user_id": row.get("actor_user_id") or "unknown",
+        "actor_role": row.get("actor_role"),
+        "action": row.get("action") or "",
+        "target": row.get("target") or "",
+        "details": details,
+        "request_id": row.get("request_id"),
     }
 
 
