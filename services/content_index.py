@@ -108,13 +108,17 @@ def upsert(row: dict, actor: str | None = None) -> dict:
         try:
             persisted = _upsert_pg(norm)
             if persisted:
-                # Try inline embedding — non-fatal on failure
-                try:
-                    eid = embed_one(persisted)
-                    if eid:
-                        persisted["embedding_id"] = eid
-                except Exception as exc:
-                    logger.warning("content embed failed for %s (%s)", persisted.get("content_id"), exc)
+                # Inline embedding — skip when row already has one (idempotent
+                # retries of load_seed must not re-embed already-embedded rows;
+                # earned 2026-05-02 when re-runs burned the gunicorn budget
+                # re-embedding existing 42 rows instead of loading remaining 27).
+                if not persisted.get("embedding_id"):
+                    try:
+                        eid = embed_one(persisted)
+                        if eid:
+                            persisted["embedding_id"] = eid
+                    except Exception as exc:
+                        logger.warning("content embed failed for %s (%s)", persisted.get("content_id"), exc)
                 return persisted
         except Exception as exc:
             logger.warning("content_index upsert PG failed (%s) — using fallback", exc)
