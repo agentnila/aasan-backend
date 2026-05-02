@@ -545,7 +545,165 @@ def create_goal(user_id: str, goal_input: dict) -> dict:
     }
     user_data[goal_id] = {"goal": goal, "path": path}
     _persist_goal_path(user_id, goal_id)
-    return {"goal_id": goal_id, "goal": goal, "path": path, "created": True}
+
+    # Auto-generate initial path. The user just told us what they want to
+    # achieve — they expect to see a learning path, not an empty pane with
+    # a "trigger recompute" instruction. We synchronously run the engine
+    # so the API response carries the populated path. Falls back to a
+    # goal-aware stub when ANTHROPIC_API_KEY isn't set so demo mode is
+    # never empty.
+    if goal_input.get("auto_generate_path", True):
+        try:
+            _generate_initial_path(user_id, goal_id)
+        except Exception as exc:
+            logger.warning("Initial path generation failed for %s/%s (%s)", user_id, goal_id, exc)
+
+    # Re-read the entry — _generate_initial_path may have populated steps
+    entry = user_data[goal_id]
+    return {"goal_id": goal_id, "goal": entry["goal"], "path": entry["path"], "created": True}
+
+
+def _generate_initial_path(user_id: str, goal_id: str) -> None:
+    """
+    Generate the initial path for a freshly-created goal.
+
+    Calls Claude when configured (real reasoning over goal + objective +
+    success criteria + timeline → ordered 8-12 step path). Falls back to
+    a goal-aware 4-step starter template otherwise so the user always
+    sees a populated path immediately after Create Goal.
+    """
+    user_data = _ensure_user(user_id)
+    if goal_id not in user_data:
+        return
+    entry = user_data[goal_id]
+    goal = entry["goal"]
+
+    if claude_client.is_live():
+        steps = _generate_path_via_claude(goal)
+        engine_label = "Claude"
+    else:
+        steps = []
+
+    if not steps:
+        steps = _stub_initial_steps(goal)
+        engine_label = "demo template"
+
+    if not steps:
+        return  # nothing to do; leave path empty rather than corrupt it
+
+    now = datetime.utcnow().isoformat()
+    entry["path"]["steps"] = steps
+    entry["path"]["estimated_total_minutes"] = sum(int(s.get("estimated_minutes") or 0) for s in steps)
+    # First step is active, the engine has already laid this out
+    active_first = next((s for s in steps if s.get("status") == "active"), steps[0] if steps else None)
+    entry["path"]["current_step_id"] = active_first["id"] if active_first else None
+    entry["path"]["last_recompute_reason"] = (
+        f"Initial path generated — {len(steps)} steps from {engine_label} on goal create."
+    )
+    entry["path"]["last_recomputed_at"] = now
+
+    history_entry = {
+        "date": now[:10],
+        "trigger": "goal_create",
+        "reason": entry["path"]["last_recompute_reason"],
+        "added": [s.get("title") for s in steps],
+        "modified_count": 0,
+    }
+    entry["path"]["recompute_history"].insert(0, history_entry)
+
+    _persist_goal_path(user_id, goal_id)
+    _persist_recompute_pg(user_id, goal_id, history_entry, trigger="goal_create")
+
+
+def _generate_path_via_claude(goal: dict) -> list:
+    """Real path generation. Returns list of step dicts (or [] on error)."""
+    system_prompt = (
+        "You are a learning path designer for a working software engineer. "
+        "Given a learner's goal, you produce an ordered initial path of "
+        "8-12 steps that takes them from foundations to demonstrable proficiency.\n\n"
+        "STRUCTURE the path:\n"
+        "  - 1-2 foundation/orientation steps (short, 5-15 min — quick wins)\n"
+        "  - 4-6 core competency steps (substantial, 30-90 min each)\n"
+        "  - 2-3 application/validation steps (project, exam, demonstration)\n\n"
+        "QUALITY rules:\n"
+        "  - Every step must be specific and actionable, not 'Learn about X'.\n"
+        "    Good: 'Build a multi-region failover with Route 53 weighted routing'.\n"
+        "    Bad: 'Learn AWS networking'.\n"
+        "  - estimated_minutes reflects real focused engagement time.\n"
+        "  - step_type: 'content' (default) | 'review' | 'refresher' | 'gap_closure' | 'assignment'\n"
+        "  - First step status is 'active'; rest are 'pending'.\n"
+        "  - inserted_by: 'engine'; inserted_reason: short rationale ('auto: foundation step before X').\n\n"
+        "Return ONLY a JSON object: { \"steps\": [{ id, order, title, step_type, status, "
+        "estimated_minutes, inserted_by, inserted_reason }] }\n"
+        "  - id format: 'step-init-N' where N is 1..len(steps)\n"
+        "  - order: 1, 2, 3, ... incrementing\n"
+        "No prose, no markdown fences."
+    )
+    user_prompt = json.dumps({
+        "goal_name": goal.get("name"),
+        "objective": goal.get("objective"),
+        "success_criteria": goal.get("success_criteria"),
+        "timeline": goal.get("timeline"),
+        "priority": goal.get("priority"),
+    }, indent=2)
+
+    response = claude_client._call_claude(
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=2048,
+    )
+    if not response:
+        return []
+    parsed = claude_client._parse_json_response(response, fallback={"steps": []})
+    raw_steps = parsed.get("steps") if isinstance(parsed, dict) else []
+    if not isinstance(raw_steps, list):
+        return []
+
+    # Defensive normalization — Claude is well-behaved but never trust
+    cleaned: list[dict] = []
+    for i, s in enumerate(raw_steps, start=1):
+        if not isinstance(s, dict):
+            continue
+        title = (s.get("title") or "").strip()
+        if not title:
+            continue
+        cleaned.append({
+            "id": s.get("id") or f"step-init-{i}",
+            "order": int(s.get("order") or i),
+            "title": title,
+            "step_type": s.get("step_type") if s.get("step_type") in ("content", "review", "refresher", "gap_closure", "assignment", "synthetic") else "content",
+            "status": s.get("status") if s.get("status") in ("active", "pending") else ("active" if i == 1 else "pending"),
+            "estimated_minutes": int(s.get("estimated_minutes") or 30),
+            "inserted_by": "engine",
+            "inserted_reason": s.get("inserted_reason") or "auto: generated for new goal",
+        })
+    # Ensure exactly one active step (first one); the rest pending
+    active_set = False
+    for s in cleaned:
+        if s["status"] == "active" and not active_set:
+            active_set = True
+        elif s["status"] == "active":
+            s["status"] = "pending"
+    if cleaned and not active_set:
+        cleaned[0]["status"] = "active"
+    return cleaned
+
+
+def _stub_initial_steps(goal: dict) -> list:
+    """
+    Goal-aware starter template for demo mode (no Claude).
+
+    Better than a blank path. Names the steps after the goal so the user
+    sees something coherent even without an API key. The Path Engine will
+    refine these once a real session fires the recompute trigger.
+    """
+    name = (goal.get("name") or "your goal").strip()
+    return [
+        {"id": "step-init-1", "order": 1, "title": f"Orient: what does {name} look like?", "step_type": "content", "status": "active",  "estimated_minutes": 20, "inserted_by": "engine", "inserted_reason": "auto: orientation step (stub mode — set ANTHROPIC_API_KEY to generate a real path)"},
+        {"id": "step-init-2", "order": 2, "title": f"Foundations — the core concepts behind {name}",                 "step_type": "content", "status": "pending", "estimated_minutes": 45, "inserted_by": "engine", "inserted_reason": "auto: foundations (stub mode)"},
+        {"id": "step-init-3", "order": 3, "title": f"Hands-on practice toward {name}",                               "step_type": "content", "status": "pending", "estimated_minutes": 90, "inserted_by": "engine", "inserted_reason": "auto: applied practice (stub mode)"},
+        {"id": "step-init-4", "order": 4, "title": f"Validation — demonstrate progress toward {name}",               "step_type": "review",  "status": "pending", "estimated_minutes": 60, "inserted_by": "engine", "inserted_reason": "auto: validation step (stub mode)"},
+    ]
 
 
 def archive_goal(user_id: str, goal_id: str) -> dict:
@@ -961,14 +1119,38 @@ def _apply_diff(path: dict, diff: dict):
 
 
 def _recompute_progress(path: dict):
-    """Update progress_pct + current_step_id based on step statuses."""
+    """
+    Update progress_pct + current_step_id based on step statuses, and
+    auto-promote the next pending step to active when nothing else is.
+
+    The auto-promote rule is what turns "mark step done" into a complete
+    user loop instead of leaving the next step in limbo. Without this, a
+    user marks done and current_step_id moves but the new "current" step
+    still has status='pending' — visually identical to all the other
+    pending steps. The promotion makes the next-up step visibly the
+    focus.
+
+    Sort by step_order so promotion respects path ordering, not insertion
+    order (engine inserts at fractional orders like 5.5).
+    """
+    sorted_steps = sorted(path["steps"], key=lambda s: float(s.get("order") or 0))
+
     completed = sum(1 for s in path["steps"] if s["status"] == "done")
     total = len(path["steps"])
     path["progress_pct"] = int((completed / total) * 100) if total else 0
 
-    # Current step = first 'active', else first 'pending'
-    active = next((s for s in path["steps"] if s["status"] == "active"), None)
-    pending = next((s for s in path["steps"] if s["status"] == "pending"), None)
+    # Auto-promote: if no step is currently 'active', flip the first
+    # pending step (by order) to active so the user always has a
+    # next-action focal point.
+    has_active = any(s["status"] == "active" for s in sorted_steps)
+    if not has_active:
+        next_pending = next((s for s in sorted_steps if s["status"] == "pending"), None)
+        if next_pending:
+            next_pending["status"] = "active"
+
+    # current_step_id = first 'active' (post-promotion) or first 'pending'
+    active = next((s for s in sorted_steps if s["status"] == "active"), None)
+    pending = next((s for s in sorted_steps if s["status"] == "pending"), None)
     path["current_step_id"] = (active or pending or {}).get("id", path.get("current_step_id"))
 
 
