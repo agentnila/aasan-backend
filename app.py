@@ -3107,19 +3107,53 @@ def catalog_search():
 def diag_vector_status():
     """
     Diagnostic — reports whether Voyage embeddings + Pinecone vector index
-    are actually live. Useful for confirming env vars wired correctly without
-    leaking the keys themselves.
+    are actually live, plus the dimension Voyage is producing and what a
+    test upsert reports. Useful when embed_pending says "embedded:69" but
+    Pinecone count stays 0 (silent fallback to stub on dimension mismatch).
     """
     out = {
         "embeddings_live": embeddings.is_live(),
         "vector_index_live": vector_index.is_live(),
         "pinecone_count": None,
-        "pinecone_error": None,
+        "pinecone_count_error": None,
+        "voyage_dim": None,
+        "voyage_error": None,
+        "pinecone_test_upsert": None,
+        "pinecone_test_upsert_error": None,
+        "pinecone_index_stats": None,
     }
+    # 1. What dim is Voyage producing?
+    try:
+        v = embeddings.embed_text("diagnostic probe vector")
+        out["voyage_dim"] = len(v) if v else 0
+    except Exception as exc:
+        out["voyage_error"] = str(exc)
+    # 2. What does Pinecone's index report?
+    try:
+        from pinecone import Pinecone
+        import os
+        pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
+        idx = pc.Index(os.environ.get("PINECONE_INDEX", ""))
+        out["pinecone_index_stats"] = idx.describe_index_stats()
+    except Exception as exc:
+        out["pinecone_index_stats"] = f"error: {exc}"
+    # 3. Try a real upsert and report the raw exception (no swallowing)
+    try:
+        v = embeddings.embed_text("diagnostic probe upsert")
+        from pinecone import Pinecone
+        import os
+        pc = Pinecone(api_key=os.environ.get("PINECONE_API_KEY", ""))
+        idx = pc.Index(os.environ.get("PINECONE_INDEX", ""))
+        idx.upsert(vectors=[("diag-probe-1", v, {"diag": True})])
+        out["pinecone_test_upsert"] = "ok"
+        idx.delete(ids=["diag-probe-1"])
+    except Exception as exc:
+        out["pinecone_test_upsert_error"] = str(exc)
+    # 4. Pinecone count via the wrapper (this is what is_live + count return)
     try:
         out["pinecone_count"] = vector_index.count()
     except Exception as exc:
-        out["pinecone_error"] = str(exc)
+        out["pinecone_count_error"] = str(exc)
     return jsonify(out)
 
 
