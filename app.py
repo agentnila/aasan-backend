@@ -3100,6 +3100,26 @@ def catalog_search():
     ))
 
 
+@app.route("/diag/vector_status", methods=["GET"])
+def diag_vector_status():
+    """
+    Diagnostic — reports whether Voyage embeddings + Pinecone vector index
+    are actually live. Useful for confirming env vars wired correctly without
+    leaking the keys themselves.
+    """
+    out = {
+        "embeddings_live": embeddings.is_live(),
+        "vector_index_live": vector_index.is_live(),
+        "pinecone_count": None,
+        "pinecone_error": None,
+    }
+    try:
+        out["pinecone_count"] = vector_index.count()
+    except Exception as exc:
+        out["pinecone_error"] = str(exc)
+    return jsonify(out)
+
+
 # ─────────────────────────────────────────────
 # V3 — Team (manager view of team learning progress)
 # Phase 1 storage: hardcoded demo team for `demo-user` manager.
