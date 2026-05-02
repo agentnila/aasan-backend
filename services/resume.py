@@ -626,15 +626,32 @@ def _count_by_category(entries):
 
 
 def _fetch_job_posting(url: str, text: str) -> dict:
-    """Fetch job posting via Perplexity Computer (if URL) or use direct text."""
-    if text and not url:
+    """
+    Resolve job posting content from URL and/or pasted text.
+
+    Resolution order:
+      1. If pasted `text` is provided, use it as the source of truth — even
+         when a URL is also given. (Skips the Perplexity dependency for
+         demos and lets users override a flaky scrape.)
+      2. Otherwise, fetch the URL via Perplexity Computer.
+      3. If Perplexity errors AND no text was provided, return a stub
+         marker so the caller falls back to _stub_tailor.
+
+    `_stub: False` signals "we have real JD content; live tailor can run."
+    `_stub: True` signals "fall back to canned tailor."
+    """
+    text = (text or "").strip()
+    url = (url or "").strip()
+
+    if text:
         return {
-            "url": None,
+            "url": url or None,
             "title": "Pasted job description",
-            "company": "Unknown",
+            "company": _guess_company_from_url(url) if url else "Unknown",
             "raw_text": text[:8000],
             "_stub": False,
         }
+
     if not url:
         return {"_stub": True, "title": "No job posting", "raw_text": "", "url": None, "company": "—"}
 
@@ -850,6 +867,155 @@ def _suggest_emphasis(top_matches, job_data):
 
 
 def _live_tailor(user_id, job_data, journal, matches):
-    """Phase 2: Claude reasons over (job + journal) to produce a richer tailored resume."""
-    # For now, fall back to stub structure; real Claude prompt is Week 7-8
-    return _stub_tailor(user_id, job_data, journal, matches)
+    """
+    Real Claude-powered tailoring.
+
+    Reasons over the actual journal entries (not just keyword matches) to produce:
+      - personalized summary grounded in the learner's track record
+      - top 3-5 highlighted projects with explicit match reasoning
+      - real gaps based on what the JD asks for vs what the journal shows
+      - emphasis suggestions tied to specific journal entries
+
+    The system prompt enforces: only cite outcomes / tech / skills that
+    actually appear in the journal. Anything Claude can't ground gets
+    listed under gaps_vs_job, never claimed.
+
+    Falls back to _stub_tailor on any failure (empty journal, malformed
+    JSON, API error) so the UI never sees a blank tailor response.
+    """
+    if not journal:
+        logger.info("Resume tailor: journal empty for %s — falling back to stub", user_id)
+        return _stub_tailor(user_id, job_data, journal, matches)
+
+    # Compact journal representation — keep input tokens manageable while
+    # preserving every field the prompt grounds claims in.
+    journal_compact = [
+        {
+            "entry_id": e.get("entry_id"),
+            "date": e.get("date"),
+            "title": e.get("title"),
+            "category": e.get("category"),
+            "description": (e.get("description") or "")[:600],
+            "outcomes": e.get("outcomes") or [],
+            "technologies": e.get("technologies") or [],
+            "transferable_skills": e.get("transferable_skills") or [],
+            "stakeholders": e.get("stakeholders") or [],
+        }
+        for e in journal
+    ]
+
+    job_title = job_data.get("title", "")
+    job_company = job_data.get("company", "")
+    job_text = (job_data.get("raw_text") or "")[:6000]
+
+    system_prompt = (
+        "You are a resume-tailoring assistant for a working software engineer. "
+        "You produce job-specific tailored resume content that is GROUNDED IN THE LEARNER'S "
+        "JOURNAL ENTRIES — never fabricated.\n\n"
+        "ABSOLUTE RULES:\n"
+        "  1. Every project, outcome, technology, and skill you cite MUST appear in a "
+        "     journal entry below. If the JD asks for something the journal doesn't show, "
+        "     list it under gaps_vs_job — do not claim the learner has it.\n"
+        "  2. highlighted_projects entries MUST set entry_id to a real journal entry's "
+        "     entry_id. Use the entry_id field exactly as given.\n"
+        "  3. match_score values are floats 0.0-1.0. Calibrate honestly — most real JDs "
+        "     should land 0.4-0.85 unless the journal is exceptionally strong/weak.\n"
+        "  4. match_reason for each highlighted_project must cite the specific JD requirement "
+        "     it addresses + the specific journal evidence (e.g. 'JD asks for incident "
+        "     response leadership; entry j-003 shows 47-min Stripe outage recovery as IC').\n"
+        "  5. Return ONLY a JSON object — no prose, no markdown fences.\n\n"
+        "OUTPUT SHAPE (match exactly):\n"
+        "{\n"
+        '  "match_score": float 0-1,\n'
+        '  "tailored_summary": "2-3 sentence elevator paragraph",\n'
+        '  "highlighted_projects": [\n'
+        '    {"entry_id": str, "title": str, "date": str, "category": str,\n'
+        '     "description": str, "outcomes": [str], "technologies": [str],\n'
+        '     "match_score": float 0-1, "match_reason": str}\n'
+        "  ],\n"
+        '  "key_outcomes_to_emphasize": [str],   // 4-6 quantified outcomes lifted verbatim\n'
+        '  "relevant_tech": [str],                // tech in BOTH journal AND JD, 8-12 items\n'
+        '  "transferable_skills": [str],          // soft skills journal evidences + JD asks for\n'
+        '  "gaps_vs_job": [str],                  // 3-5 honest gaps, framed constructively\n'
+        '  "experiences_to_emphasize": [str]      // 2-4 short tactical tips citing specific entries\n'
+        "}\n\n"
+        "Quality bar: a recruiter reading this output should be unable to tell which entries "
+        "you're citing without being explicit. Be specific. No generic resume filler."
+    )
+
+    user_prompt = (
+        f"JOB POSTING — {job_title}"
+        + (f" at {job_company}" if job_company and job_company not in ("Unknown", "—") else "")
+        + ":\n\n"
+        f"{job_text or '(no JD body — tailor based on the role title alone)'}\n\n"
+        "═══════════════════════════════════════════\n\n"
+        f"LEARNER JOURNAL — {len(journal_compact)} entries, most recent first:\n\n"
+        f"{json.dumps(journal_compact, indent=2)}"
+    )
+
+    try:
+        response = claude_client._call_claude(
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=2048,
+            model=claude_client.DEFAULT_MODEL,
+        )
+        parsed = claude_client._parse_json_response(response, fallback=None)
+        if parsed is None or not isinstance(parsed, dict):
+            logger.warning("Resume tailor: Claude returned malformed JSON for %s — falling back to stub", user_id)
+            return _stub_tailor(user_id, job_data, journal, matches)
+
+        # Defensive normalization — ensure every expected field is present
+        # with a sane type. Claude generally complies but we never want a
+        # KeyError on the frontend.
+        highlighted = parsed.get("highlighted_projects") or []
+        if not isinstance(highlighted, list):
+            highlighted = []
+
+        return {
+            "user_id": user_id,
+            "job_url": job_data.get("url"),
+            "job_title": job_title,
+            "job_company": job_company,
+            "tailored_at": datetime.utcnow().isoformat(),
+            "match_score": _coerce_float(parsed.get("match_score"), default=0.0),
+            "tailored_summary": str(parsed.get("tailored_summary") or ""),
+            "highlighted_projects": [
+                {
+                    "entry_id": p.get("entry_id"),
+                    "title": str(p.get("title") or ""),
+                    "date": str(p.get("date") or ""),
+                    "category": str(p.get("category") or "project"),
+                    "description": str(p.get("description") or ""),
+                    "outcomes": list(p.get("outcomes") or []),
+                    "technologies": list(p.get("technologies") or []),
+                    "match_score": _coerce_float(p.get("match_score"), default=0.0),
+                    "match_reason": str(p.get("match_reason") or ""),
+                }
+                for p in highlighted
+                if isinstance(p, dict)
+            ],
+            "key_outcomes_to_emphasize": list(parsed.get("key_outcomes_to_emphasize") or []),
+            "relevant_tech": list(parsed.get("relevant_tech") or []),
+            "transferable_skills": list(parsed.get("transferable_skills") or []),
+            "gaps_vs_job": list(parsed.get("gaps_vs_job") or []),
+            "experiences_to_emphasize": list(parsed.get("experiences_to_emphasize") or []),
+            "modes": {
+                "computer": "live" if perplexity_client.is_live() else "stub",
+                "classifier": "live",
+            },
+            "_stub": False,
+        }
+    except Exception as exc:
+        logger.warning("Resume tailor live call failed for %s (%s) — falling back to stub", user_id, exc)
+        return _stub_tailor(user_id, job_data, journal, matches)
+
+
+def _coerce_float(v, default: float = 0.0) -> float:
+    """Defensive: Claude sometimes returns floats as strings or ints."""
+    try:
+        f = float(v)
+        # Clamp to [0, 1] for match-score-like fields
+        return max(0.0, min(1.0, f))
+    except (TypeError, ValueError):
+        return default
