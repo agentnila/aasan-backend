@@ -31,6 +31,7 @@ import json
 import logging
 from datetime import datetime
 from . import claude_client, db
+from . import content_index as content_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -250,10 +251,21 @@ def _load_user_from_pg(user_id: str) -> dict:
             SELECT step_id, step_order, title, step_type, status,
                    estimated_minutes, actual_minutes, mastery_at_completion,
                    inserted_by, inserted_reason, completed_at, inserted_at,
-                   content_url, content_provider, content_title, content_id
+                   content_url, content_provider, content_title, content_id,
+                   phase_local_id, step_rationale, is_free
             FROM path_steps
             WHERE user_id = %s AND goal_id = %s
             ORDER BY step_order
+            """,
+            (user_id, goal_id),
+        ) or []
+        phase_rows = db.query(
+            """
+            SELECT phase_local_id, order_index, title, duration_weeks,
+                   rationale_md, deliverable_md
+            FROM path_phases
+            WHERE user_id = %s AND goal_id = %s
+            ORDER BY order_index
             """,
             (user_id, goal_id),
         ) or []
@@ -270,7 +282,7 @@ def _load_user_from_pg(user_id: str) -> dict:
 
         user_data[goal_id] = {
             "goal": _row_to_goal(g),
-            "path": _rows_to_path(path_row, step_rows, history_rows, goal_id),
+            "path": _rows_to_path(path_row, step_rows, history_rows, goal_id, phase_rows=phase_rows),
         }
     return user_data
 
@@ -298,7 +310,7 @@ def _row_to_goal(row: dict) -> dict:
     }
 
 
-def _rows_to_path(path_row, step_rows, history_rows, goal_id: str) -> dict:
+def _rows_to_path(path_row, step_rows, history_rows, goal_id: str, phase_rows=None) -> dict:
     if not path_row:
         return {
             "id": f"path-{goal_id}",
@@ -310,7 +322,18 @@ def _rows_to_path(path_row, step_rows, history_rows, goal_id: str) -> dict:
             "last_recomputed_at": None,
             "recompute_history": [],
             "steps": [],
+            "phases": [],
         }
+    phases_out = []
+    for ph in (phase_rows or []):
+        phases_out.append({
+            "phase_local_id": ph.get("phase_local_id"),
+            "order_index": int(ph.get("order_index") or 0),
+            "title": ph.get("title", ""),
+            "duration_weeks": ph.get("duration_weeks"),
+            "rationale_md": ph.get("rationale_md"),
+            "deliverable_md": ph.get("deliverable_md"),
+        })
     return {
         "id": path_row.get("path_id") or f"path-{goal_id}",
         "title": path_row.get("title", ""),
@@ -329,6 +352,7 @@ def _rows_to_path(path_row, step_rows, history_rows, goal_id: str) -> dict:
             for h in history_rows
         ],
         "steps": [_row_to_step(s) for s in step_rows],
+        "phases": phases_out,
     }
 
 
@@ -342,7 +366,8 @@ def _row_to_step(row: dict) -> dict:
     }
     for opt in ("estimated_minutes", "actual_minutes", "mastery_at_completion",
                 "inserted_by", "inserted_reason",
-                "content_url", "content_provider", "content_title", "content_id"):
+                "content_url", "content_provider", "content_title", "content_id",
+                "phase_local_id", "step_rationale", "is_free"):
         v = row.get(opt)
         if v is not None:
             out[opt] = float(v) if opt == "mastery_at_completion" else v
@@ -442,6 +467,29 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                     "active",
                 ),
             )
+            # Replace path_phases for this goal (delete first, then re-insert)
+            cur.execute(
+                "DELETE FROM path_phases WHERE user_id = %s AND goal_id = %s",
+                (user_id, goal_id),
+            )
+            for phase in p.get("phases", []) or []:
+                cur.execute(
+                    """
+                    INSERT INTO path_phases
+                        (user_id, goal_id, phase_local_id, order_index, title,
+                         duration_weeks, rationale_md, deliverable_md)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        user_id, goal_id,
+                        phase.get("phase_local_id") or "",
+                        int(phase.get("order_index") or 0),
+                        phase.get("title", ""),
+                        phase.get("duration_weeks"),
+                        phase.get("rationale_md"),
+                        phase.get("deliverable_md"),
+                    ),
+                )
             cur.execute(
                 "DELETE FROM path_steps WHERE user_id = %s AND goal_id = %s",
                 (user_id, goal_id),
@@ -454,8 +502,9 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                          status, estimated_minutes, actual_minutes,
                          mastery_at_completion, inserted_by, inserted_reason,
                          completed_at,
-                         content_url, content_provider, content_title, content_id)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                         content_url, content_provider, content_title, content_id,
+                         phase_local_id, step_rationale, is_free)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         user_id, goal_id, step["id"],
@@ -473,6 +522,9 @@ def _persist_goal_path(user_id: str, goal_id: str) -> None:
                         step.get("content_provider"),
                         step.get("content_title"),
                         step.get("content_id"),
+                        step.get("phase_local_id"),
+                        step.get("step_rationale"),
+                        bool(step.get("is_free")) if step.get("is_free") is not None else None,
                     ),
                 )
     except Exception as exc:
@@ -634,11 +686,29 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
     entry = user_data[goal_id]
     goal = entry["goal"]
 
+    steps: list = []
+    phases: list = []
+    engine_label = "demo template"
+
     if claude_client.is_live():
-        steps = _generate_path_via_claude(goal)
-        engine_label = "Claude"
-    else:
-        steps = []
+        # L4a — try RAG-augmented generation first. Pulls candidates from the
+        # content_catalog (Pinecone-backed) and asks Claude to organize them
+        # into phases, selecting steps by content_id (no fabricated URLs).
+        candidates = _retrieve_catalog_candidates(goal, top_k=80)
+        if candidates:
+            try:
+                phased = _generate_phased_path_via_claude(goal, candidates)
+                if phased and phased.get("steps"):
+                    steps = phased["steps"]
+                    phases = phased.get("phases") or []
+                    engine_label = "Claude · RAG-augmented"
+            except Exception as exc:
+                logger.warning("RAG path generation failed (%s) — falling back to legacy", exc)
+
+        # Fallback — legacy single-pass generator (Claude invents URLs, no phases)
+        if not steps:
+            steps = _generate_path_via_claude(goal)
+            engine_label = "Claude · legacy"
 
     if not steps:
         steps = _stub_initial_steps(goal)
@@ -649,12 +719,14 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
 
     now = datetime.utcnow().isoformat()
     entry["path"]["steps"] = steps
+    entry["path"]["phases"] = phases  # may be []
     entry["path"]["estimated_total_minutes"] = sum(int(s.get("estimated_minutes") or 0) for s in steps)
     # First step is active, the engine has already laid this out
     active_first = next((s for s in steps if s.get("status") == "active"), steps[0] if steps else None)
     entry["path"]["current_step_id"] = active_first["id"] if active_first else None
+    phase_summary = f", {len(phases)} phases" if phases else ""
     entry["path"]["last_recompute_reason"] = (
-        f"Initial path generated — {len(steps)} steps from {engine_label} on goal create."
+        f"Initial path generated — {len(steps)} steps{phase_summary} from {engine_label} on goal create."
     )
     entry["path"]["last_recomputed_at"] = now
 
@@ -669,6 +741,192 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
 
     _persist_goal_path(user_id, goal_id)
     _persist_recompute_pg(user_id, goal_id, history_entry, trigger="goal_create")
+
+
+def _retrieve_catalog_candidates(goal: dict, top_k: int = 80) -> list[dict]:
+    """
+    Pull top-K catalog candidates relevant to the goal via content_catalog.retrieve().
+    Returns the rows enriched with _score (cosine similarity from Pinecone).
+    Empty list if catalog is empty or vector index is offline.
+
+    Query composition: goal name + objective + success_criteria + (when present)
+    the attached context_text. Skips priority/timeline since those don't affect
+    semantic relevance.
+    """
+    parts = [
+        (goal.get("name") or "").strip(),
+        (goal.get("objective") or "").strip(),
+        (goal.get("success_criteria") or "").strip(),
+        (goal.get("context_text") or "").strip(),
+    ]
+    query = "\n".join(p for p in parts if p)
+    if not query:
+        return []
+    try:
+        return content_catalog.retrieve(query_text=query, top_k=top_k)
+    except Exception as exc:
+        logger.warning("catalog retrieve failed (%s) — RAG path disabled", exc)
+        return []
+
+
+def _generate_phased_path_via_claude(goal: dict, candidates: list[dict]) -> dict | None:
+    """
+    L4a — RAG-augmented path generation.
+
+    Asks Claude to organize the goal into 3-6 phases, selecting 2-4 steps per
+    phase from `candidates` BY content_id. Claude does not invent URLs —
+    every step's content_url comes from a real catalog row.
+
+    Returns: { steps: [...], phases: [...] } or None on failure.
+        phase shape: {phase_local_id, order_index, title, duration_weeks, rationale_md, deliverable_md}
+        step shape:  the same shape as _generate_path_via_claude returns,
+                     plus phase_local_id, content_id, step_rationale, is_free
+    """
+    if not candidates:
+        return None
+
+    # Compact candidate listing for the prompt — Claude needs enough to choose
+    # well but the prompt has to fit. Title + source + skills + difficulty +
+    # is_free + duration is sufficient signal; description is omitted (would
+    # blow the token budget at top_k=80).
+    cand_lines: list[str] = []
+    by_id: dict[int, dict] = {}
+    for c in candidates:
+        cid = c.get("content_id")
+        if not cid:
+            continue
+        by_id[cid] = c
+        skills = ",".join((c.get("skills") or [])[:5])
+        cand_lines.append(
+            f"  cid={cid} | {c.get('source','')} | {(c.get('title') or '')[:90]} | "
+            f"skills=[{skills}] | {c.get('difficulty') or '—'} | "
+            f"{'free' if c.get('is_free') else 'paid'} | "
+            f"{c.get('duration_minutes') or '?'}min"
+        )
+
+    candidate_block = "\n".join(cand_lines)
+
+    system_prompt = (
+        "You are a learning path designer. Given a learner's goal and a list of "
+        "vetted, real-world learning resources from a curated catalog, you organize "
+        "the journey into 3-6 PHASES (e.g. Foundations → Core skill → Specialization → "
+        "Application/Capstone), and for each phase you SELECT 2-4 resources from the "
+        "candidates by their content_id (cid).\n\n"
+        "STRICT RULES:\n"
+        "  - You MUST only use content_ids that appear in the candidate list. Never invent.\n"
+        "  - Each step references exactly one content_id (the cid number).\n"
+        "  - Sequencing within a phase: foundations before specialization.\n"
+        "  - Mix free + paid sensibly; if the goal mentions budget constraints prefer free.\n"
+        "  - 8-16 steps total across all phases is the right range.\n"
+        "  - First step's status is 'active', the rest 'pending'.\n\n"
+        "PHASE-LEVEL FIELDS:\n"
+        "  - title: 3-7 words, e.g. 'Foundations of LLMs and Agents'\n"
+        "  - duration_weeks: realistic span; sum across phases ≤ goal timeline\n"
+        "  - rationale_md: 1-2 sentence WHY this phase exists (what gap it closes)\n"
+        "  - deliverable_md: 1 sentence concrete artifact the learner ships at end of phase\n\n"
+        "STEP-LEVEL FIELDS:\n"
+        "  - step_rationale: 1 sentence why THIS resource fits THIS phase (not generic praise)\n"
+        "  - estimated_minutes: use the candidate's duration_minutes; if 0 or missing, estimate 60\n\n"
+        "Return ONLY a JSON object:\n"
+        "{\n"
+        "  \"phases\": [\n"
+        "    {\"phase_local_id\":\"phase-1\", \"order_index\":1, \"title\":\"...\",\n"
+        "     \"duration_weeks\":3, \"rationale_md\":\"...\", \"deliverable_md\":\"...\",\n"
+        "     \"steps\":[{\"cid\":42, \"step_rationale\":\"...\"}, ...]\n"
+        "    }, ...\n"
+        "  ]\n"
+        "}\n"
+        "No prose, no markdown fences."
+    )
+
+    context_text = (goal.get("context_text") or "").strip()
+    goal_payload = {
+        "goal_name": goal.get("name"),
+        "objective": goal.get("objective"),
+        "success_criteria": goal.get("success_criteria"),
+        "timeline": goal.get("timeline"),
+    }
+
+    user_prompt_parts = [
+        "GOAL:\n" + json.dumps(goal_payload, indent=2),
+        "\n\nCANDIDATES (select from these by cid only — do NOT invent):\n" + candidate_block,
+    ]
+    if context_text:
+        user_prompt_parts.append(
+            "\n\nATTACHED CONTEXT (primary signal for what the path should cover):\n" + context_text
+        )
+
+    response = claude_client._call_claude(
+        system=system_prompt,
+        messages=[{"role": "user", "content": "".join(user_prompt_parts)}],
+        max_tokens=4096,
+    )
+    if not response:
+        return None
+
+    parsed = claude_client._parse_json_response(response, fallback={"phases": []})
+    raw_phases = parsed.get("phases") if isinstance(parsed, dict) else []
+    if not isinstance(raw_phases, list) or not raw_phases:
+        return None
+
+    # Materialize: validate cids, fetch full rows, compose steps + phases
+    phases: list[dict] = []
+    steps: list[dict] = []
+    step_counter = 0
+
+    for p_idx, raw_p in enumerate(raw_phases, start=1):
+        if not isinstance(raw_p, dict):
+            continue
+        phase_local_id = (raw_p.get("phase_local_id") or f"phase-{p_idx}").strip() or f"phase-{p_idx}"
+        title = (raw_p.get("title") or "").strip()
+        if not title:
+            continue
+        phases.append({
+            "phase_local_id": phase_local_id,
+            "order_index": int(raw_p.get("order_index") or p_idx),
+            "title": title,
+            "duration_weeks": int(raw_p.get("duration_weeks") or 0) or None,
+            "rationale_md": (raw_p.get("rationale_md") or "").strip() or None,
+            "deliverable_md": (raw_p.get("deliverable_md") or "").strip() or None,
+        })
+        for raw_s in raw_p.get("steps") or []:
+            if not isinstance(raw_s, dict):
+                continue
+            cid = raw_s.get("cid") or raw_s.get("content_id")
+            try:
+                cid_int = int(cid)
+            except (TypeError, ValueError):
+                continue
+            row = by_id.get(cid_int)
+            if not row:
+                # Claude tried to invent. Skip silently — this is what
+                # the validation step is here to prevent.
+                logger.info("skip step: cid %s not in candidate set", cid_int)
+                continue
+            step_counter += 1
+            est_minutes = int(row.get("duration_minutes") or 0) or 60
+            steps.append({
+                "id": f"step-rag-{step_counter}",
+                "order": step_counter,
+                "title": row.get("title") or "(untitled)",
+                "step_type": "content",
+                "status": "active" if step_counter == 1 else "pending",
+                "estimated_minutes": est_minutes,
+                "inserted_by": "engine",
+                "inserted_reason": (raw_s.get("step_rationale") or "").strip() or "RAG-selected from catalog",
+                "content_url": row.get("source_url") or None,
+                "content_provider": row.get("source") or None,
+                "content_title": row.get("title") or None,
+                "content_id": cid_int,
+                "phase_local_id": phase_local_id,
+                "step_rationale": (raw_s.get("step_rationale") or "").strip() or None,
+                "is_free": bool(row.get("is_free")),
+            })
+
+    if not steps or not phases:
+        return None
+
+    return {"steps": steps, "phases": phases}
 
 
 def _generate_path_via_claude(goal: dict) -> list:

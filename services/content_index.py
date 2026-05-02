@@ -665,6 +665,12 @@ def _list_pg(filters: dict, limit: int, offset: int) -> dict:
     return {"items": items, "total": total, "limit": limit, "offset": offset, "facets": {"by_source": facets}}
 
 
+def fetch_by_ids(content_ids: list[int]) -> list[dict]:
+    """Public wrapper — used by path_engine when materializing Claude's
+    chosen candidates back into full catalog rows (URL, source, duration, etc.)."""
+    return _bulk_fetch(content_ids)
+
+
 def _bulk_fetch(content_ids: list[int]) -> list[dict]:
     if not content_ids:
         return []
