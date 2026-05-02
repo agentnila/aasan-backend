@@ -3,7 +3,17 @@ services:
     name: aasan-peraasan-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    # gunicorn defaults to 30s worker timeout, which kills mid-request
+    # for any Claude call that runs longer than that — initial path
+    # generation (8-12 steps via Sonnet 4.5) and resume tailor on rich
+    # JDs both routinely run 25-40s. Bumping to 120s gives plenty of
+    # headroom; if a worker is genuinely stuck longer than that we
+    # want it killed anyway. graceful-timeout matches so the kill is
+    # clean. --workers 1 keeps in-memory caches consistent until Tier 0
+    # persistence covers every service (path_engine, work_items, resume,
+    # audit_log are migrated; admin/scim/gigs/team are not yet — those
+    # would diverge across workers).
+    startCommand: gunicorn --workers 1 --timeout 120 --graceful-timeout 30 --keep-alive 5 app:app
     envVars:
       - key: NEO4J_URI
         sync: false
@@ -22,4 +32,18 @@ services:
       # V3 — Perplexity Computer (deep agentic web execution)
       # When unset, services/perplexity_client.py runs in stub mode
       - key: PERPLEXITY_API_KEY
+        sync: false
+      # Tier 0 persistence (Supabase Postgres) — services/db.py reads these.
+      # Without them every dual-mode service uses the in-memory fallback.
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DB_HOST
+        sync: false
+      - key: SUPABASE_DB_USER
+        sync: false
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
