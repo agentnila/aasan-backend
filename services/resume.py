@@ -885,7 +885,9 @@ def _live_tailor(user_id, job_data, journal, matches):
     """
     if not journal:
         logger.info("Resume tailor: journal empty for %s — falling back to stub", user_id)
-        return _stub_tailor(user_id, job_data, journal, matches)
+        out = _stub_tailor(user_id, job_data, journal, matches)
+        out["_stub_reason"] = "empty_journal"
+        return out
 
     # Compact journal representation — keep input tokens manageable while
     # preserving every field the prompt grounds claims in.
@@ -954,16 +956,31 @@ def _live_tailor(user_id, job_data, journal, matches):
     )
 
     try:
+        # max_tokens=4096 — earlier 2048 caused output truncation on richer
+        # JDs (5 highlighted projects with full match_reason + outcomes lists
+        # easily push past 2K). Sonnet 4.5 happily handles up to 8K output;
+        # 4096 is plenty of headroom while keeping latency bounded.
         response = claude_client._call_claude(
             system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
-            max_tokens=2048,
+            max_tokens=4096,
             model=claude_client.DEFAULT_MODEL,
         )
+        if not response:
+            logger.warning("Resume tailor: Claude returned empty response for %s — falling back to stub", user_id)
+            out = _stub_tailor(user_id, job_data, journal, matches)
+            out["_stub_reason"] = "claude_empty_response"
+            return out
         parsed = claude_client._parse_json_response(response, fallback=None)
         if parsed is None or not isinstance(parsed, dict):
-            logger.warning("Resume tailor: Claude returned malformed JSON for %s — falling back to stub", user_id)
-            return _stub_tailor(user_id, job_data, journal, matches)
+            logger.warning(
+                "Resume tailor: Claude returned malformed JSON for %s — first 200 chars: %r",
+                user_id, (response or "")[:200],
+            )
+            out = _stub_tailor(user_id, job_data, journal, matches)
+            out["_stub_reason"] = "claude_malformed_json"
+            out["_claude_raw_preview"] = (response or "")[:300]
+            return out
 
         # Defensive normalization — ensure every expected field is present
         # with a sane type. Claude generally complies but we never want a
@@ -1008,7 +1025,10 @@ def _live_tailor(user_id, job_data, journal, matches):
         }
     except Exception as exc:
         logger.warning("Resume tailor live call failed for %s (%s) — falling back to stub", user_id, exc)
-        return _stub_tailor(user_id, job_data, journal, matches)
+        out = _stub_tailor(user_id, job_data, journal, matches)
+        out["_stub_reason"] = "claude_call_exception"
+        out["_claude_error"] = f"{type(exc).__name__}: {exc}"
+        return out
 
 
 def _coerce_float(v, default: float = 0.0) -> float:
