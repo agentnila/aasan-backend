@@ -211,10 +211,14 @@ def retrieve(query_text: str, top_k: int = 30, filters: dict | None = None) -> l
     if vector_index.is_live() or vector_index._stub_count() > 0:
         try:
             query_vec = embeddings.embed_text(query_text)
+            # Only add filter keys when the caller supplied a real value.
+            # Earlier we wrote `if "is_free" in filters: pinecone_filter["is_free"] = bool(filters["is_free"])`,
+            # which turned a missing/None into is_free=False — excluding every
+            # free-content row in the catalog and yielding zero matches.
             pinecone_filter = {}
-            if "is_free" in filters:
+            if filters.get("is_free") is not None:
                 pinecone_filter["is_free"] = bool(filters["is_free"])
-            if "source" in filters:
+            if filters.get("source"):
                 pinecone_filter["source"] = filters["source"]
             matches = vector_index.query(query_vec, top_k=top_k, filter=pinecone_filter or None)
             if matches:
