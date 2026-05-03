@@ -32,6 +32,7 @@ import logging
 from datetime import datetime
 from . import claude_client, db
 from . import content_index as content_catalog
+from . import perplexity_research
 from . import resume as _resume_svc
 from . import work_items as _work_items_svc
 
@@ -693,24 +694,49 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
     engine_label = "demo template"
 
     if claude_client.is_live():
-        # L4a — try RAG-augmented generation first. Pulls candidates from the
-        # content_catalog (Pinecone-backed) and asks Claude to organize them
-        # into phases, selecting steps by content_id (no fabricated URLs).
-        candidates = _retrieve_catalog_candidates(goal, top_k=80)
+        # L5 — candidate-source priority chain:
+        #   1. Perplexity Sonar (live web research, current URLs)
+        #   2. content_catalog (Pinecone-backed RAG over our seeded catalog)
+        #   3. Legacy single-pass Claude (invents URLs, no phases)
+        candidates: list[dict] = []
+        candidate_engine = ""
+
+        if perplexity_research.is_live():
+            try:
+                candidates = perplexity_research.find_learning_candidates(
+                    goal_text=" ".join(filter(None, [
+                        goal.get("name") or "",
+                        goal.get("objective") or "",
+                        goal.get("success_criteria") or "",
+                    ])),
+                    context_text=(goal.get("context_text") or ""),
+                    top_n=30,
+                )
+                if candidates:
+                    candidate_engine = "Perplexity Sonar"
+            except Exception as exc:
+                logger.warning("Perplexity Sonar candidate fetch failed (%s)", exc)
+
+        if not candidates:
+            catalog_candidates = _retrieve_catalog_candidates(goal, top_k=80)
+            if catalog_candidates:
+                candidates = catalog_candidates
+                candidate_engine = "catalog (RAG)"
+
         if candidates:
             try:
                 phased = _generate_phased_path_via_claude(goal, candidates, user_id=user_id)
                 if phased and phased.get("steps"):
                     steps = phased["steps"]
                     phases = phased.get("phases") or []
-                    engine_label = "Claude · RAG-augmented"
+                    engine_label = f"Claude · {candidate_engine}"
             except Exception as exc:
-                logger.warning("RAG path generation failed (%s) — falling back to legacy", exc)
+                logger.warning("Phased generation failed (%s) — falling back to legacy", exc)
 
-        # Fallback — legacy single-pass generator (Claude invents URLs, no phases)
+        # Final fallback — legacy single-pass generator (Claude invents URLs, no phases)
         if not steps:
             steps = _generate_path_via_claude(goal, user_id=user_id)
-            engine_label = "Claude · legacy"
+            engine_label = "Claude · legacy (no candidates)"
 
     if not steps:
         steps = _stub_initial_steps(goal)
@@ -896,16 +922,19 @@ def _generate_phased_path_via_claude(goal: dict, candidates: list[dict], user_id
     # well but the prompt has to fit. Title + source + skills + difficulty +
     # is_free + duration is sufficient signal; description is omitted (would
     # blow the token budget at top_k=80).
+    # Candidate IDs may be int (catalog "content-N") OR string ("pplx-N" from
+    # Perplexity Sonar). Key by str throughout so both sources work uniformly.
     cand_lines: list[str] = []
-    by_id: dict[int, dict] = {}
+    by_id: dict[str, dict] = {}
     for c in candidates:
         cid = c.get("content_id")
-        if not cid:
+        if cid is None or cid == "":
             continue
-        by_id[cid] = c
+        cid_str = str(cid)
+        by_id[cid_str] = c
         skills = ",".join((c.get("skills") or [])[:5])
         cand_lines.append(
-            f"  cid={cid} | {c.get('source','')} | {(c.get('title') or '')[:90]} | "
+            f"  cid={cid_str} | {c.get('source','')} | {(c.get('title') or '')[:90]} | "
             f"skills=[{skills}] | {c.get('difficulty') or '—'} | "
             f"{'free' if c.get('is_free') else 'paid'} | "
             f"{c.get('duration_minutes') or '?'}min"
@@ -1003,18 +1032,25 @@ def _generate_phased_path_via_claude(goal: dict, candidates: list[dict], user_id
             if not isinstance(raw_s, dict):
                 continue
             cid = raw_s.get("cid") or raw_s.get("content_id")
-            try:
-                cid_int = int(cid)
-            except (TypeError, ValueError):
+            if cid is None:
                 continue
-            row = by_id.get(cid_int)
+            cid_str = str(cid)
+            row = by_id.get(cid_str)
             if not row:
-                # Claude tried to invent. Skip silently — this is what
-                # the validation step is here to prevent.
-                logger.info("skip step: cid %s not in candidate set", cid_int)
+                # Claude tried to invent. Skip silently.
+                logger.info("skip step: cid %s not in candidate set", cid_str)
                 continue
             step_counter += 1
             est_minutes = int(row.get("duration_minutes") or 0) or 60
+            # content_id (FK to content_index) is only set for catalog candidates,
+            # not for Perplexity candidates which aren't in our DB.
+            db_content_id = None
+            if not cid_str.startswith("pplx-"):
+                try:
+                    db_content_id = int(cid_str)
+                except (TypeError, ValueError):
+                    db_content_id = None
+            source_engine = row.get("_source_engine") or "catalog"
             steps.append({
                 "id": f"step-rag-{step_counter}",
                 "order": step_counter,
@@ -1023,11 +1059,11 @@ def _generate_phased_path_via_claude(goal: dict, candidates: list[dict], user_id
                 "status": "active" if step_counter == 1 else "pending",
                 "estimated_minutes": est_minutes,
                 "inserted_by": "engine",
-                "inserted_reason": (raw_s.get("step_rationale") or "").strip() or "RAG-selected from catalog",
+                "inserted_reason": (raw_s.get("step_rationale") or "").strip() or f"selected from {source_engine}",
                 "content_url": row.get("source_url") or None,
                 "content_provider": row.get("source") or None,
                 "content_title": row.get("title") or None,
-                "content_id": cid_int,
+                "content_id": db_content_id,
                 "phase_local_id": phase_local_id,
                 "step_rationale": (raw_s.get("step_rationale") or "").strip() or None,
                 "is_free": bool(row.get("is_free")),

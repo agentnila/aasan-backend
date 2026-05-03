@@ -3216,6 +3216,32 @@ def catalog_search():
     ))
 
 
+@app.route("/diag/research_status", methods=["GET"])
+def diag_research_status():
+    """
+    Diagnostic — reports which path-candidate engines are live and the
+    expected priority order Path Engine will use. Useful when paths
+    aren't picking up Perplexity (key unset, model misconfigured, etc.).
+    """
+    from services import perplexity_research as _pr
+    return jsonify({
+        "perplexity_sonar": _pr.diag(),
+        "vector_index": {
+            "is_live": vector_index.is_live(),
+            "pinecone_count": (lambda: vector_index.count() if vector_index.is_live() else 0)(),
+        },
+        "claude": {
+            "is_live": claude_client.is_live(),
+        },
+        "priority_chain": [
+            "perplexity_sonar (live web research)",
+            "content_catalog / Pinecone (RAG fallback)",
+            "claude legacy single-pass (no candidates fallback)",
+            "stub template (no Claude)",
+        ],
+    })
+
+
 @app.route("/diag/vector_status", methods=["GET"])
 def diag_vector_status():
     """
