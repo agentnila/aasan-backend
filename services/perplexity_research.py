@@ -93,9 +93,57 @@ def find_learning_candidates(
             "[perplexity_research] Sonar returned content but parsed 0 candidates. Raw preview: %s",
             raw[:400].replace("\n", " "),
         )
-    else:
-        logger.info("[perplexity_research] returned %d candidates for: %s", len(candidates), query[:80])
+        return candidates
+
+    # HEAD-check every URL — Sonar sometimes hallucinates plausible URLs even
+    # though it has web access. Drop the broken ones rather than ship 404s
+    # to learners. Earned 2026-05-02 — user clicked a Sonar URL, got 404.
+    candidates = _validate_urls(candidates)
+    logger.info(
+        "[perplexity_research] returned %d valid candidates for: %s",
+        len(candidates), query[:80],
+    )
     return candidates
+
+
+def _validate_urls(candidates: list[dict], timeout_s: int = 5) -> list[dict]:
+    """
+    Concurrent HEAD-check of every candidate URL. Drops 404/410/000 (DNS fail).
+    Keeps 200/301/302/403 (403 = anti-bot block, works in browser).
+
+    ~1-2s added latency at top_n=20 (concurrent). Cheap insurance against
+    Sonar hallucinations.
+    """
+    import concurrent.futures
+    import requests
+
+    def check(c: dict) -> tuple[dict, int]:
+        url = c.get("source_url", "")
+        try:
+            r = requests.head(
+                url,
+                allow_redirects=True,
+                timeout=timeout_s,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Aasan/1.0; +https://aasan.app)"},
+            )
+            return (c, r.status_code)
+        except Exception:
+            return (c, 0)
+
+    out: list[dict] = []
+    dropped = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for c, code in pool.map(check, candidates):
+            # 200 OK, 301/302 redirect, 403 = anti-bot (works in browser)
+            if code in (200, 301, 302, 403):
+                out.append(c)
+            else:
+                logger.info("[perplexity_research] dropped %s (HTTP %s): %s",
+                            c.get("source", "?"), code, c.get("source_url", "")[:80])
+                dropped += 1
+    if dropped:
+        logger.warning("[perplexity_research] dropped %d candidate(s) with broken URLs", dropped)
+    return out
 
 
 def _compose_query(goal_text: str, context_text: str) -> str:
