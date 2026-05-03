@@ -703,6 +703,9 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
 
         if perplexity_research.is_live():
             try:
+                # top_n=20 not 30 — Sonar reliably delivers 15-20 well-formed
+                # candidates inside the gunicorn timeout; asking for 30 risks
+                # truncated JSON / timeout fall-through to catalog/legacy.
                 candidates = perplexity_research.find_learning_candidates(
                     goal_text=" ".join(filter(None, [
                         goal.get("name") or "",
@@ -710,7 +713,8 @@ def _generate_initial_path(user_id: str, goal_id: str) -> None:
                         goal.get("success_criteria") or "",
                     ])),
                     context_text=(goal.get("context_text") or ""),
-                    top_n=30,
+                    top_n=20,
+                    timeout_s=75,
                 )
                 if candidates:
                     candidate_engine = "Perplexity Sonar"

@@ -76,14 +76,26 @@ def find_learning_candidates(
     title/source_url/etc directly from the candidate dict (no DB lookup).
     """
     if not is_live():
+        logger.info("[perplexity_research] is_live=False (PERPLEXITY_API_KEY unset)")
         return []
     query = _compose_query(goal_text, context_text)
     if not query:
+        logger.info("[perplexity_research] empty query — nothing to search")
         return []
     raw = _call_sonar(query, top_n, timeout_s)
     if not raw:
+        logger.warning("[perplexity_research] Sonar returned no content (HTTP error or timeout) — see prior logs")
         return []
-    return _parse_candidates(raw, top_n)
+    candidates = _parse_candidates(raw, top_n)
+    if not candidates:
+        # Don't lose this — log a snippet so we can diagnose JSON-shape issues
+        logger.warning(
+            "[perplexity_research] Sonar returned content but parsed 0 candidates. Raw preview: %s",
+            raw[:400].replace("\n", " "),
+        )
+    else:
+        logger.info("[perplexity_research] returned %d candidates for: %s", len(candidates), query[:80])
+    return candidates
 
 
 def _compose_query(goal_text: str, context_text: str) -> str:
