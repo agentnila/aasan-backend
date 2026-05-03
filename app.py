@@ -3263,6 +3263,78 @@ def diag_research_status():
     })
 
 
+@app.route("/diag/perplexity_probe", methods=["GET"])
+def diag_perplexity_probe():
+    """
+    Diagnostic — actually CALLS Perplexity Sonar with a real query and reports
+    everything: HTTP status, raw response body, parse result, candidate count.
+    No exception swallowing. Use when /diag/research_status says is_live:true
+    but path generation still falls through to catalog/legacy.
+    """
+    import requests
+    from services import perplexity_research as _pr
+    out = {
+        "is_live": _pr.is_live(),
+        "model": _pr.SONAR_MODEL,
+        "endpoint": _pr.SONAR_API_URL,
+        "http_status": None,
+        "response_keys": None,
+        "raw_content_preview": None,
+        "candidate_count": 0,
+        "error": None,
+    }
+    if not _pr.is_live():
+        out["error"] = "PERPLEXITY_API_KEY not set"
+        return jsonify(out)
+    try:
+        body = {
+            "model": _pr.SONAR_MODEL,
+            "messages": [
+                {"role": "system", "content": "Return a JSON object: {\"hello\": \"world\"}. No prose."},
+                {"role": "user", "content": "Say hello in JSON."},
+            ],
+            "temperature": 0.1,
+        }
+        response = requests.post(
+            _pr.SONAR_API_URL,
+            headers={
+                "Authorization": f"Bearer {_pr.PERPLEXITY_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+            timeout=30,
+        )
+        out["http_status"] = response.status_code
+        try:
+            data = response.json()
+            out["response_keys"] = sorted(list(data.keys())) if isinstance(data, dict) else None
+            choices = data.get("choices") or [] if isinstance(data, dict) else []
+            if choices:
+                msg = choices[0].get("message") or {}
+                content = msg.get("content") or ""
+                out["raw_content_preview"] = content[:500]
+        except Exception as exc_inner:
+            out["error"] = f"json decode: {exc_inner} — raw body: {response.text[:300]}"
+            return jsonify(out)
+        # Try a real candidate fetch on a simple goal to see end-to-end behavior
+        candidates = _pr.find_learning_candidates(
+            goal_text="Become an AI agent builder",
+            context_text="",
+            top_n=5,
+            timeout_s=30,
+        )
+        out["candidate_count"] = len(candidates)
+        if candidates:
+            out["sample_candidate"] = {
+                "title": candidates[0].get("title"),
+                "source": candidates[0].get("source"),
+                "url": candidates[0].get("source_url"),
+            }
+    except Exception as exc:
+        out["error"] = str(exc)
+    return jsonify(out)
+
+
 @app.route("/diag/vector_status", methods=["GET"])
 def diag_vector_status():
     """
