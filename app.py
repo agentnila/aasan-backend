@@ -3263,6 +3263,126 @@ def diag_research_status():
     })
 
 
+@app.route("/diag/path_generation", methods=["GET"])
+def diag_path_generation():
+    """
+    Deep diagnostic — runs every stage of path generation against a test
+    goal, reports timing + result + any error per stage. No exceptions
+    swallowed. Use when paths fall through to stub/legacy unexpectedly.
+
+    Stages run:
+      1. Perplexity Sonar candidate fetch (top_n=20, 75s timeout)
+      2. URL validation (HEAD-check) on Sonar candidates
+      3. Catalog candidate fetch (Pinecone)
+      4. Phased Claude generation (only if any candidates from #1 or #3)
+      5. Legacy Claude generation (always runs, independent test)
+
+    Open in browser: /diag/path_generation
+    Optional ?goal=... to override the test goal.
+    """
+    import time
+    from services import perplexity_research as _pr
+
+    test_goal_text = request.args.get("goal") or "Become an AI Agent Builder"
+    test_goal = {
+        "id": "diag-test-goal",
+        "name": test_goal_text,
+        "objective": "Transition from current role into building production AI agents",
+        "success_criteria": "Ship a working agent system on GitHub",
+        "timeline": "6 months",
+        "context_text": "",
+    }
+    out = {"test_goal": test_goal_text, "stages": []}
+
+    # Stage 1 — Perplexity Sonar
+    s1 = {"name": "perplexity_sonar", "elapsed_s": None, "ok": False, "count": 0, "error": None, "sample": None}
+    t0 = time.time()
+    try:
+        sonar_candidates = _pr.find_learning_candidates(
+            goal_text=test_goal_text,
+            context_text="",
+            top_n=20,
+            timeout_s=75,
+        )
+        s1["count"] = len(sonar_candidates)
+        s1["ok"] = bool(sonar_candidates)
+        if sonar_candidates:
+            c0 = sonar_candidates[0]
+            s1["sample"] = {
+                "title": c0.get("title"),
+                "source": c0.get("source"),
+                "url": c0.get("source_url"),
+                "is_free": c0.get("is_free"),
+            }
+    except Exception as exc:
+        s1["error"] = str(exc)
+    s1["elapsed_s"] = round(time.time() - t0, 2)
+    out["stages"].append(s1)
+
+    # Stage 2 — Catalog (Pinecone)
+    s2 = {"name": "catalog_rag", "elapsed_s": None, "ok": False, "count": 0, "error": None}
+    t0 = time.time()
+    try:
+        cat_candidates = path_engine._retrieve_catalog_candidates(test_goal, top_k=80)
+        s2["count"] = len(cat_candidates)
+        s2["ok"] = bool(cat_candidates)
+    except Exception as exc:
+        s2["error"] = str(exc)
+    s2["elapsed_s"] = round(time.time() - t0, 2)
+    out["stages"].append(s2)
+
+    # Stage 3 — Phased Claude (only if we have candidates from somewhere)
+    s3 = {"name": "phased_claude", "elapsed_s": None, "ok": False, "step_count": 0, "phase_count": 0, "error": None}
+    candidates_for_phased = (
+        sonar_candidates if s1["ok"] else (cat_candidates if s2["ok"] else [])
+    )
+    if candidates_for_phased:
+        t0 = time.time()
+        try:
+            phased = path_engine._generate_phased_path_via_claude(
+                test_goal, candidates_for_phased, user_id="u-balaji"
+            )
+            if phased:
+                s3["step_count"] = len(phased.get("steps") or [])
+                s3["phase_count"] = len(phased.get("phases") or [])
+                s3["ok"] = bool(phased.get("steps"))
+        except Exception as exc:
+            s3["error"] = str(exc)
+        s3["elapsed_s"] = round(time.time() - t0, 2)
+    else:
+        s3["error"] = "skipped (no candidates available)"
+    out["stages"].append(s3)
+
+    # Stage 4 — Legacy Claude (independent test, always runs)
+    s4 = {"name": "legacy_claude", "elapsed_s": None, "ok": False, "step_count": 0, "error": None}
+    t0 = time.time()
+    try:
+        legacy_steps = path_engine._generate_path_via_claude(test_goal, user_id="u-balaji")
+        s4["step_count"] = len(legacy_steps or [])
+        s4["ok"] = bool(legacy_steps)
+    except Exception as exc:
+        s4["error"] = str(exc)
+    s4["elapsed_s"] = round(time.time() - t0, 2)
+    out["stages"].append(s4)
+
+    # Total
+    out["total_elapsed_s"] = round(sum((s.get("elapsed_s") or 0) for s in out["stages"]), 2)
+    out["recommendation"] = _recommend_from_diag(out["stages"])
+    return jsonify(out)
+
+
+def _recommend_from_diag(stages):
+    """Quick triage from the stage results."""
+    by_name = {s["name"]: s for s in stages}
+    if by_name["perplexity_sonar"]["ok"]:
+        return "✅ Sonar working — paths should use it. If real path-create falls through anyway, check gunicorn timeout vs total pipeline elapsed."
+    if by_name["legacy_claude"]["ok"]:
+        return "⚠️ Sonar broken but legacy Claude works — paths will fall through to legacy with invented URLs."
+    if by_name["legacy_claude"]["error"]:
+        return f"🔴 Both Sonar and legacy Claude failing — likely Claude API issue: {by_name['legacy_claude']['error']}"
+    return "🔴 Everything failing silently — check Anthropic + Perplexity API keys and Render logs"
+
+
 @app.route("/diag/perplexity_probe", methods=["GET"])
 def diag_perplexity_probe():
     """
