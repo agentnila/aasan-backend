@@ -132,6 +132,13 @@ def _live_count() -> int:
     return int((stats or {}).get("total_vector_count", 0))
 
 
+def _live_delete_all() -> dict:
+    """Pinecone supports delete_all=True per namespace. We use the default ns."""
+    idx = _get_pinecone_index()
+    idx.delete(delete_all=True)
+    return {"ok": True, "mode": "live"}
+
+
 # ──────────────────────────────────────────────────────────────
 # Public interface
 # ──────────────────────────────────────────────────────────────
@@ -152,6 +159,31 @@ def query(vector: list, top_k: int = 10, filter: dict = None) -> list:
         except Exception as exc:
             print(f"[vector_index] Pinecone query failed, falling back to stub: {exc}")
     return _stub_query(vector, top_k, filter)
+
+
+def delete_all() -> dict:
+    """
+    Wipe every vector from the index. Used by /admin/content/wipe_vectors
+    when the user wants a full reset. Returns {ok, mode, before, after}.
+    """
+    before = 0
+    try:
+        before = count()
+    except Exception:
+        pass
+    if _has_pinecone():
+        try:
+            _live_delete_all()
+        except Exception as exc:
+            print(f"[vector_index] Pinecone delete_all failed, also clearing stub: {exc}")
+    _STORE.clear()
+    after = 0
+    try:
+        after = count()
+    except Exception:
+        pass
+    return {"ok": True, "mode": "live" if _has_pinecone() else "stub",
+            "before": before, "after": after}
 
 
 def delete(item_id: str) -> dict:

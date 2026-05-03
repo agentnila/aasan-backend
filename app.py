@@ -3174,6 +3174,27 @@ def admin_content_embed_pending():
     ))
 
 
+@app.route("/admin/content/wipe_vectors", methods=["POST"])
+def admin_content_wipe_vectors():
+    """
+    Destructive: clears every vector from the live Pinecone index AND the
+    in-memory stub. Requires { "confirm": "yes" } in the body so curl typos
+    can't accidentally wipe the index.
+
+    Use after TRUNCATE-ing content_index in Postgres (the SQL reset script)
+    so PG and Pinecone end up consistent (both empty).
+    """
+    if not verify_secret(request):
+        return jsonify({"error": "Unauthorized"}), 401
+    actor = rbac.get_actor_user_id(request)
+    if not rbac.has_any_permission(actor, "admin:users"):
+        return jsonify({"error": "forbidden — admin:users required"}), 403
+    data = request.json or {}
+    if (data.get("confirm") or "").strip().lower() != "yes":
+        return jsonify({"error": "destructive — pass {\"confirm\":\"yes\"} to proceed"}), 400
+    return jsonify(vector_index.delete_all())
+
+
 @app.route("/catalog/search", methods=["POST"])
 def catalog_search():
     """
